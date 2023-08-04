@@ -504,8 +504,9 @@ if __name__ == "__main__":
 	chief_print("______________________________")
 
 
-	batch_size = train_opts["batch_size"]
-	learning_rate = train_opts["learning_rate"]
+	batch_size = train_opts["batch_size"] * num_devices
+	learning_rate = train_opts["learning_rate"] * num_devices
+	# TODO: ^ check this later
 	regularizer = train_opts["regularizer"]
 
 	superpopulations_file = arguments['superpops']
