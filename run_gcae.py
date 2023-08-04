@@ -8,23 +8,23 @@ Usage:
   run_gcae.py evaluate --datadir=<name> --metrics=<name>  [  --data=<name>  --model_id=<name> --train_opts_id=<name> --data_opts_id=<name>  --superpops=<name> --epoch=<num> --trainedmodeldir=<name>  --pdata=<name> --trainedmodelname=<name>]
 
 Options:
-  -h --help             show this screen
-  --datadir=<name>      directory where sample data is stored. if not absolute: assumed relative to GenoCAE/ directory. DEFAULT: data/
-  --data=<name>         file prefix, not including path, of the data files (EIGENSTRAT of PLINK format)
-  --trainedmodeldir=<name>     base path where to save model training directories. if not absolute: assumed relative to GenoCAE/ directory. DEFAULT: ae_out/
-  --model_id=<name>     model id, corresponding to a file models/model_id.json
-  --train_opts_id=<name>train options id, corresponding to a file train_opts/train_opts_id.json
-  --data_opts_id=<name> data options id, corresponding to a file data_opts/data_opts_id.json
-  --epochs<num>         number of epochs to train
-  --resume_from<num>	saved epoch to resume training from. set to -1 for latest saved epoch. DEFAULT: None (don't resume)
-  --save_interval<num>	epoch intervals at which to save state of model. DEFAULT: None (don't save)
-  --start_saving_from<num>	number of epochs to train before starting to save model state. DEFAULT: 0.
-  --trainedmodelname=<name> name of the model training directory to fetch saved model state from when project/plot/evaluating
-  --pdata=<name>     	file prefix, not including path, of data to project/plot/evaluate. if not specified, assumed to be the same the model was trained on.
-  --epoch<num>          epoch at which to project/plot/evaluate data. DEFAULT: all saved epochs
-  --superpops<name>     path+filename of file mapping populations to superpopulations. used to color populations of the same superpopulation in similar colors in plotting. if not absolute path: assumed relative to GenoCAE/ directory.
-  --metrics=<name>      the metric(s) to evaluate, e.g. hull_error of f1 score. can pass a list with multiple metrics, e.g. "f1_score_3,f1_score_5". DEFAULT: f1_score_3
-  --patience=<num>	 	stop training after this number of epochs without improving lowest validation. DEFAULT: None
+  -h --help                  show this screen
+  --datadir=<name>           directory where sample data is stored. if not absolute: assumed relative to GenoCAE/ directory. DEFAULT: data/
+  --data=<name>              file prefix, not including path, of the data files (EIGENSTRAT of PLINK format)
+  --trainedmodeldir=<name>   base path where to save model training directories. if not absolute: assumed relative to GenoCAE/ directory. DEFAULT: ae_out/
+  --model_id=<name>          model id, corresponding to a file models/{model_id}.json
+  --train_opts_id=<name>     train options id, corresponding to a file train_opts/{train_opts_id}.json
+  --data_opts_id=<name>      data options id, corresponding to a file data_opts/{data_opts_id}.json
+  --epochs<num>              number of epochs to train
+  --resume_from<num>         saved epoch to resume training from. set to -1 for latest saved epoch. DEFAULT: None (don't resume)
+  --save_interval<num>       epoch intervals at which to save state of model. DEFAULT: None (don't save)
+  --start_saving_from<num>   number of epochs to train before starting to save model state. DEFAULT: 0.
+  --trainedmodelname=<name>  name of the model training directory to fetch saved model state from when project/plot/evaluating
+  --pdata=<name>             file prefix, not including path, of data to project/plot/evaluate. if not specified, assumed to be the same the model was trained on.
+  --epoch<num>               epoch at which to project/plot/evaluate data. DEFAULT: all saved epochs
+  --superpops<name>          path+filename of file mapping populations to superpopulations. used to color populations of the same superpopulation in similar colors in plotting. if not absolute path: assumed relative to GenoCAE/ directory.
+  --metrics=<name>           the metric(s) to evaluate, e.g. hull_error of f1 score. can pass a list with multiple metrics, e.g. "f1_score_3,f1_score_5". DEFAULT: f1_score_3
+  --patience=<num>           stop training after this number of epochs without improving lowest validation. DEFAULT: None
 
 """
 
@@ -34,7 +34,7 @@ import tensorflow.distribute as tfd
 import tensorflow.distribute.experimental as tfde
 from tensorflow.keras import Model, layers
 from datetime import datetime
-from utils.data_handler import  get_saved_epochs, get_projected_epochs, write_h5, read_h5, get_coords_by_pop, data_generator_ae, convex_hull_error, f1_score_kNN, plot_genotype_hist, to_genotypes_sigmoid_round, to_genotypes_invscale_round, GenotypeConcordance, get_pops_with_k, get_ind_pop_list_from_map, get_baseline_gc, write_metric_per_epoch_to_csv
+from utils.data_handler import get_saved_epochs, get_projected_epochs, write_h5, read_h5, get_coords_by_pop, data_generator_ae, convex_hull_error, f1_score_kNN, plot_genotype_hist, to_genotypes_sigmoid_round, to_genotypes_invscale_round, GenotypeConcordance, get_pops_with_k, get_ind_pop_list_from_map, get_baseline_gc, write_metric_per_epoch_to_csv
 from utils.visualization import plot_coords_by_superpop, plot_clusters_by_superpop, plot_coords, plot_coords_by_pop, make_animation, write_f1_scores_to_csv
 import utils.visualization
 import utils.layers
@@ -201,6 +201,9 @@ class Autoencoder(Model):
 		# indicator if were doing genetic clustering (ADMIXTURE-style) or not
 		have_encoded_raw = False
 
+		# initializing encoded data
+		encoded_data = None
+
 		# do all layers except first
 		for layer_def in self.all_layers[1:]:
 			try:
@@ -227,7 +230,7 @@ class Autoencoder(Model):
 				encoded_data_raw = x
 
 			# If this is the encoding layer, we add noise if we are training
-			if layer_name == "encoded":
+			elif "encoded" in layer_name:
 				if self.noise_std and not have_encoded_raw:
 					x = self.noise_layer(x, training = is_training)
 				encoded_data = x
@@ -247,7 +250,7 @@ class Autoencoder(Model):
 			if verbose:
 				chief_print("--- shape: {0}".format(x.shape))
 
-		if self.regularizer:
+		if self.regularizer and encoded_data is not None:
 			reg_module = eval(self.regularizer["module"])
 			reg_name = getattr(reg_module, self.regularizer["class"])
 			reg_func = reg_name(float(self.regularizer["reg_factor"]))
@@ -284,31 +287,31 @@ class Autoencoder(Model):
 
 	def injectms(self, verbose, x, layer_name, ms_tiled, ms_variable):
 		if verbose:
-				chief_print("----- injecting marker-specific variable")
+			chief_print("----- injecting marker-specific variable")
 
 		# if we need to reshape ms_variable before concatting it
 		if not self.n_markers == x.shape[1]:
-				d = int(math.ceil(float(self.n_markers) / int(x.shape[1])))
-				diff = d*int(x.shape[1]) - self.n_markers
-				ms_var = tf.reshape(tf.pad(ms_variable,[[0,0],[0,diff]]), (-1, x.shape[1],d))
-				# Tiling it to handle the batch dimension
-				ms_tiled = tf.tile(ms_var, (tf.shape(x)[0],1,1))
+			d = int(math.ceil(float(self.n_markers) / int(x.shape[1])))
+			diff = d*int(x.shape[1]) - self.n_markers
+			ms_var = tf.reshape(tf.pad(ms_variable,[[0,0],[0,diff]]), (-1, x.shape[1],d))
+			# Tiling it to handle the batch dimension
+			ms_tiled = tf.tile(ms_var, (tf.shape(x)[0],1,1))
 
 		else:
-				# Tiling it to handle the batch dimension
-				ms_tiled = tf.tile(ms_variable, (x.shape[0],1))
-				ms_tiled = tf.expand_dims(ms_tiled, 2)
+			# Tiling it to handle the batch dimension
+			ms_tiled = tf.tile(ms_variable, (x.shape[0],1))
+			ms_tiled = tf.expand_dims(ms_tiled, 2)
 
 		if "_sg" in layer_name:
-				if verbose:
-						chief_print("----- stopping gradient for marker-specific variable")
-				ms_tiled = tf.stop_gradient(ms_tiled)
+			if verbose:
+				chief_print("----- stopping gradient for marker-specific variable")
+			ms_tiled = tf.stop_gradient(ms_tiled)
 
 
 		if verbose:
-				chief_print("ms var {}".format(ms_variable.shape))
-				chief_print("ms tiled {}".format(ms_tiled.shape))
-				chief_print("concatting: {0} {1}".format(x.shape, ms_tiled.shape))
+			chief_print("ms var {}".format(ms_variable.shape))
+			chief_print("ms tiled {}".format(ms_tiled.shape))
+			chief_print("concatting: {0} {1}".format(x.shape, ms_tiled.shape))
 
 		x = tf.concat([x, ms_tiled], 2)
 
@@ -369,7 +372,7 @@ def alfreqvector(y_pred):
 		return tf.nn.softmax(y_pred)
 
 def save_ae_weights(epoch, train_directory, autoencoder, prefix=""):
-	weights_file_prefix = "{}/weights/{}{}".format(train_directory, prefix, epoch)
+	weights_file_prefix = os.path.join(train_directory, "weights", f"{prefix}{epoch}")
 	startTime = datetime.now()
 	autoencoder.save_weights(weights_file_prefix, save_format ="tf")
 	save_time = (datetime.now() - startTime).total_seconds()
@@ -444,42 +447,43 @@ if __name__ == "__main__":
 	if arguments["trainedmodeldir"]:
 		trainedmodeldir = arguments["trainedmodeldir"]
 		if not os.path.isabs(trainedmodeldir):
-			trainedmodeldir="{}/{}/".format(GCAE_DIR, trainedmodeldir)
+			trainedmodeldir = os.path.join(GCAE_DIR, trainedmodeldir)
 
 	else:
-		trainedmodeldir="{}/ae_out/".format(GCAE_DIR)
+		trainedmodeldir = os.path.join(GCAE_DIR, "ae_out")
 
 	if arguments["datadir"]:
 		datadir = arguments["datadir"]
 		if not os.path.isabs(datadir):
-			datadir="{}/{}/".format(GCAE_DIR, datadir)
+			datadir = os.path.join(GCAE_DIR, datadir)
 
 	else:
-		datadir="{}/data/".format(GCAE_DIR)
+		datadir = os.path.join(GCAE_DIR, "data")
 
 	if arguments["trainedmodelname"]:
 		trainedmodelname = arguments["trainedmodelname"]
-		train_directory = trainedmodeldir + trainedmodelname
+		train_directory = os.path.join(trainedmodeldir, trainedmodelname)
 
-		data_opts_id = trainedmodelname.split(".")[3]
-		train_opts_id = trainedmodelname.split(".")[2]
-		model_id = trainedmodelname.split(".")[1]
-		data = trainedmodelname.split(".")[4]
+		namesplit = trainedmodelname.split(".")
+		data_opts_id = namesplit[3]
+		train_opts_id = namesplit[2]
+		model_id = namesplit[1]
+		data = namesplit[4]
 
 	else:
-		data = arguments['data']
+		data = arguments["data"]
 		data_opts_id = arguments["data_opts_id"]
 		train_opts_id = arguments["train_opts_id"]
 		model_id = arguments["model_id"]
 		train_directory = False
 
-	with open("{}/data_opts/{}.json".format(GCAE_DIR, data_opts_id)) as data_opts_def_file:
+	with open(os.path.join(GCAE_DIR, "data_opts", data_opts_id+".json")) as data_opts_def_file:
 		data_opts = json.load(data_opts_def_file)
 
-	with open("{}/train_opts/{}.json".format(GCAE_DIR, train_opts_id)) as train_opts_def_file:
+	with open(os.path.join(GCAE_DIR, "train_opts", train_opts_id+".json")) as train_opts_def_file:
 		train_opts = json.load(train_opts_def_file)
 
-	with open("{}/models/{}.json".format(GCAE_DIR, model_id)) as model_def_file:
+	with open(os.path.join(GCAE_DIR, "models", model_id+".json")) as model_def_file:
 		model_architecture = json.load(model_def_file)
 
 	for layer_def in model_architecture["layers"]:
@@ -511,7 +515,9 @@ if __name__ == "__main__":
 
 	superpopulations_file = arguments['superpops']
 	if superpopulations_file and not os.path.isabs(os.path.dirname(superpopulations_file)):
-		superpopulations_file="{}/{}/{}".format(GCAE_DIR, os.path.dirname(superpopulations_file), Path(superpopulations_file).name)
+		superpopulations_file = os.path.join(GCAE_DIR,
+		                                     os.path.dirname(superpopulations_file),
+		                                     Path(superpopulations_file).name)
 
 	norm_opts = data_opts["norm_opts"]
 	norm_mode = data_opts["norm_mode"]
@@ -542,21 +548,24 @@ if __name__ == "__main__":
 		n_input_channels = 2
 
 	if not train_directory:
-		train_directory = trainedmodeldir + "ae." + model_id + "." + train_opts_id + "." + data_opts_id  + "." + data
+		train_directory = os.path.join(trainedmodeldir,
+		                               ".".join(("ae", model_id,
+		                                         train_opts_id, data_opts_id,
+		                                         data)))
 
 	if arguments["pdata"]:
 		pdata = arguments["pdata"]
 	else:
 		pdata = data
 
-	data_prefix = datadir + pdata
-	results_directory = "{0}/{1}".format(train_directory, pdata)
+	data_prefix = os.path.join(datadir, pdata)
+	results_directory = os.path.join(train_directory, pdata)
 	try:
 		os.mkdir(results_directory)
 	except OSError:
 		pass
 
-	encoded_data_file = "{0}/{1}/{2}".format(train_directory, pdata, "encoded_data.h5")
+	encoded_data_file = os.path.join(train_directory, pdata, "encoded_data.h5")
 
 	if "noise_std" in train_opts.keys():
 		noise_std = train_opts["noise_std"]
@@ -601,10 +610,9 @@ if __name__ == "__main__":
 
 	else:
 		dg = data_generator_ae(data_prefix,
-							   normalization_mode = norm_mode,
-							   normalization_options = norm_opts,
-							   impute_missing = fill_missing)
-
+		                       normalization_mode = norm_mode,
+		                       normalization_options = norm_opts,
+		                       impute_missing = fill_missing)
 		n_markers = copy.deepcopy(dg.n_markers)
 
 		loss_def = train_opts["loss"]
@@ -748,7 +756,7 @@ if __name__ == "__main__":
 
 		if resume_from:
 			chief_print("\n______________________________ Resuming training from epoch {0} ______________________________".format(resume_from))
-			weights_file_prefix = "{0}/{1}/{2}".format(train_directory, "weights", resume_from)
+			weights_file_prefix = os.path.join(train_directory, "weights", str(resume_from))
 			chief_print("Reading weights from {0}".format(weights_file_prefix))
 
 			# get a single sample to run through optimization to reload weights and optimizer variables
@@ -775,8 +783,8 @@ if __name__ == "__main__":
 
 		######### Create objects for tensorboard summary ###############################
 
-		train_writer = tf.summary.create_file_writer(train_directory + '/train')
-		valid_writer = tf.summary.create_file_writer(train_directory + '/valid')
+		train_writer = tf.summary.create_file_writer(os.path.join(train_directory, "train"))
+		valid_writer = tf.summary.create_file_writer(os.path.join(train_directory, "valid"))
 
 		######################################################
 
@@ -784,8 +792,7 @@ if __name__ == "__main__":
 		losses_t = []
 		# valid losses per epoch
 		losses_v = []
-
-
+		# min loss stats
 		min_valid_loss = np.inf
 		min_valid_loss_epoch = None
 
@@ -869,7 +876,7 @@ if __name__ == "__main__":
 					min_valid_loss_epoch = effective_epoch
 
 					if e > start_saving_from:
-						for f in glob.glob("{}/weights/min_valid.{}.*".format(train_directory, prev_min_val_loss_epoch)):
+						for f in glob.glob(os.path.join(train_directory, "weights", f"min_valid.{prev_min_val_loss_epoch}.*")):
 							os.remove(f)
 						save_ae_weights(effective_epoch, train_directory, autoencoder, prefix = "min_valid.")
 
@@ -887,16 +894,16 @@ if __name__ == "__main__":
 
 		save_ae_weights(effective_epoch, train_directory, autoencoder)
 
-		outfilename = train_directory + "/" + "train_times.csv"
+		outfilename = os.path.join(train_directory, "train_times.csv")
 		write_metric_per_epoch_to_csv(outfilename, train_times, train_epochs)
 
-		outfilename = "{0}/losses_from_train_t.csv".format(train_directory)
+		outfilename = os.path.join(train_directory, "losses_from_train_t.csv")
 		epochs_t_combined, losses_t_combined = write_metric_per_epoch_to_csv(outfilename, losses_t, train_epochs)
 		fig, ax = plt.subplots()
 		plt.plot(epochs_t_combined, losses_t_combined, label="train", c="orange")
 
 		if n_valid_samples > 0:
-			outfilename = "{0}/losses_from_train_v.csv".format(train_directory)
+			outfilename = os.path.join(train_directory, "losses_from_train_v.csv")
 			epochs_v_combined, losses_v_combined = write_metric_per_epoch_to_csv(outfilename, losses_v, train_epochs)
 			plt.plot(epochs_v_combined, losses_v_combined, label="valid", c="blue")
 			min_valid_loss_epoch = epochs_v_combined[np.argmin(losses_v_combined)]
@@ -908,7 +915,7 @@ if __name__ == "__main__":
 		plt.xlabel("Epoch")
 		plt.ylabel("Loss function value")
 		plt.legend()
-		plt.savefig("{}/losses_from_train.pdf".format(train_directory))
+		plt.savefig(os.path.join(train_directory, "losses_from_train.pdf"))
 		plt.close()
 
 		chief_print("Done training. Wrote to {0}".format(train_directory))
@@ -960,7 +967,7 @@ if __name__ == "__main__":
 
 		for epoch in epochs:
 			chief_print("########################### epoch {0} ###########################".format(epoch))
-			weights_file_prefix = "{0}/{1}/{2}".format(train_directory, "weights", epoch)
+			weights_file_prefix = os.path.join(train_directory, "weights", str(epoch))
 			chief_print("Reading weights from {0}".format(weights_file_prefix))
 
 			input, targets, _= dg.get_train_batch(sparsify_fraction, 1)
@@ -1062,8 +1069,7 @@ if __name__ == "__main__":
 				genotype_concordance_metric.update_state(y_pred = genotypes_output[orig_nonmissing_mask], y_true = true_genotypes[orig_nonmissing_mask])
 
 			else:
-				chief_print("Could not calculate predicted genotypes and genotype concordance. Not implemented for loss {0} and normalization {1}.".format(train_opts["loss"]["class"],
-																																					data_opts["norm_mode"]))
+				chief_print("Could not calculate predicted genotypes and genotype concordance. Not implemented for loss {0} and normalization {1}.".format(train_opts["loss"]["class"], data_opts["norm_mode"]))
 				genotypes_output = np.array([])
 				true_genotypes = np.array([])
 
@@ -1076,10 +1082,18 @@ if __name__ == "__main__":
 				coords_by_pop = get_coords_by_pop(data_prefix, encoded_train, ind_pop_list = ind_pop_list_train)
 
 				if doing_clustering:
-					plot_clusters_by_superpop(coords_by_pop, "{0}/clusters_e_{1}".format(results_directory, epoch), superpopulations_file, write_legend = epoch == epochs[0])
+					plot_clusters_by_superpop(coords_by_pop,
+					                          os.path.join(results_directory,
+					                                       f"clusters_e_{epoch}"),
+					                          superpopulations_file,
+					                          write_legend = epoch == epochs[0])
 				else:
 					scatter_points, colors, markers, edgecolors = \
-						plot_coords_by_superpop(coords_by_pop,"{0}/dimred_e_{1}_by_superpop".format(results_directory, epoch), superpopulations_file, plot_legend = epoch == epochs[0])
+						plot_coords_by_superpop(coords_by_pop,
+						                        os.path.join(results_directory,
+						                                     f"dimred_e_{epoch}_by_superpop"),
+						                        superpopulations_file,
+						                        plot_legend = epoch == epochs[0])
 
 					scatter_points_per_epoch.append(scatter_points)
 					colors_per_epoch.append(colors)
@@ -1089,33 +1103,38 @@ if __name__ == "__main__":
 			else:
 				try:
 					coords_by_pop = get_coords_by_pop(data_prefix, encoded_train, ind_pop_list = ind_pop_list_train)
-					plot_coords_by_pop(coords_by_pop, "{0}/dimred_e_{1}_by_pop".format(results_directory, epoch))
+					plot_coords_by_pop(coords_by_pop,
+					                   os.path.join(results_directory,
+					                                f"dimred_e_{epoch}_by_pop"))
 				except:
-					plot_coords(encoded_train, "{0}/dimred_e_{1}".format(results_directory, epoch))
+					plot_coords(encoded_train,
+					            os.path.join(results_directory,
+					                         f"dimred_e_{epoch}"))
 
 
-			write_h5(encoded_data_file, "{0}_encoded_train".format(epoch), encoded_train)
+			write_h5(encoded_data_file, f"{epoch}_encoded_train", encoded_train)
 
 		try:
-			plot_genotype_hist(np.array(genotypes_output), "{0}/{1}_e{2}".format(results_directory, "output_as_genotypes", epoch))
-			plot_genotype_hist(np.array(true_genotypes), "{0}/{1}".format(results_directory, "true_genotypes"))
+			plot_genotype_hist(np.array(genotypes_output),
+			                   os.path.join(results_directory,
+			                                f"output_as_genotypes_e{epoch}"))
+			plot_genotype_hist(np.array(true_genotypes),
+			                   os.path.join(results_directory,
+			                                "true_genotypes"))
 		except:
 			pass
 
 		############################### losses ##############################
 
-		outfilename = "{0}/losses_from_project.csv".format(results_directory)
+		outfilename = os.path.join(results_directory, "losses_from_project.csv")
 		epochs_combined, losses_train_combined = write_metric_per_epoch_to_csv(outfilename, losses_train, epochs)
 
-
 		plt.plot(epochs_combined, losses_train_combined,
-				 label="all data",
-				 c="red")
-
+		         label="all data", c="red")
 		plt.xlabel("Epoch")
 		plt.ylabel("Loss function value")
 		plt.legend()
-		plt.savefig(results_directory + "/" + "losses_from_project.pdf")
+		plt.savefig(os.path.join(results_directory, "losses_from_project.pdf"))
 		plt.close()
 
 
@@ -1125,7 +1144,7 @@ if __name__ == "__main__":
 		except:
 			baseline_genotype_concordance = None
 
-		outfilename = "{0}/genotype_concordances.csv".format(results_directory)
+		outfilename = os.path.join(results_directory, "genotype_concordances.csv")
 		epochs_combined, genotype_concs_combined = write_metric_per_epoch_to_csv(outfilename, genotype_concs_train, epochs)
 
 		plt.plot(epochs_combined, genotype_concs_combined, label="train", c="orange")
@@ -1135,7 +1154,7 @@ if __name__ == "__main__":
 		plt.xlabel("Epoch")
 		plt.ylabel("Genotype concordance")
 
-		plt.savefig(results_directory + "/" + "genotype_concordances.pdf")
+		plt.savefig(os.path.join(results_directory, "genotype_concordances.pdf"))
 
 		plt.close()
 
@@ -1176,7 +1195,10 @@ if __name__ == "__main__":
 			markers_per_epoch.append(markers)
 			edgecolors_per_epoch.append(edgecolors)
 
-		make_animation(epochs, scatter_points_per_epoch, colors_per_epoch, markers_per_epoch, edgecolors_per_epoch, "{0}/{1}{2}".format(results_directory, "dimred_animation", suffix))
+		make_animation(epochs, scatter_points_per_epoch, colors_per_epoch,
+		               markers_per_epoch, edgecolors_per_epoch,
+		               os.path.join(results_directory,
+		                            f"dimred_animation{suffix}"))
 
 	if arguments['evaluate']:
 
@@ -1285,10 +1307,10 @@ if __name__ == "__main__":
 			plt.plot(epochs, metrics[m], label="train", c="orange")
 			plt.xlabel("Epoch")
 			plt.ylabel(m)
-			plt.savefig("{0}/{1}.pdf".format(results_directory, m))
+			plt.savefig(os.path.join(results_directory, m+".pdf"))
 			plt.close()
 
-			outfilename = "{0}/{1}.csv".format(results_directory, m)
+			outfilename = os.path.join(results_directory, m+".csv")
 			with open(outfilename, mode='w') as res_file:
 				res_writer = csv.writer(res_file, delimiter=',')
 				res_writer.writerow(epochs)
@@ -1319,15 +1341,26 @@ if __name__ == "__main__":
 				coords_by_pop = get_coords_by_pop(data_prefix, encoded_train, ind_pop_list = ind_pop_list_train)
 
 				if doing_clustering:
-					plot_clusters_by_superpop(coords_by_pop, "{0}/clusters_e_{1}".format(results_directory, epoch), superpopulations_file, write_legend = epoch == epochs[0])
+					plot_clusters_by_superpop(coords_by_pop,
+					                          os.path.join(results_directory,
+					                                       f"clusters_e_{epoch}"),
+					                          superpopulations_file,
+					                          write_legend = epoch == epochs[0])
 				else:
 					scatter_points, colors, markers, edgecolors = \
-						plot_coords_by_superpop(coords_by_pop, "{0}/dimred_e_{1}_by_superpop".format(results_directory, epoch), superpopulations_file, plot_legend = epoch == epochs[0])
+						plot_coords_by_superpop(coords_by_pop,
+						                        os.path.join(results_directory,
+						                                     f"dimred_e_{epoch}_by_superpop"),
+						                        superpopulations_file,
+						                        plot_legend = epoch == epochs[0])
 
 			else:
 				try:
-					plot_coords_by_pop(coords_by_pop, "{0}/dimred_e_{1}_by_pop".format(results_directory, epoch))
+					plot_coords_by_pop(coords_by_pop,
+					                   os.path.join(results_directory,
+					                                f"dimred_e_{epoch}_by_pop"))
 				except:
-					plot_coords(encoded_train, "{0}/dimred_e_{1}".format(results_directory, epoch))
-
+					plot_coords(encoded_train,
+					            os.path.join(results_directory,
+					                         f"dimred_e_{epoch}"))
 
