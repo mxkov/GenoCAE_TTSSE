@@ -30,6 +30,8 @@ Options:
 
 from docopt import docopt, DocoptExit
 import tensorflow as tf
+import tensorflow.distribute as tfd
+import tensorflow.distribute.experimental as tfde
 from tensorflow.keras import Model, layers
 from datetime import datetime
 from utils.data_handler import  get_saved_epochs, get_projected_epochs, write_h5, read_h5, get_coords_by_pop, data_generator_ae, convex_hull_error, f1_score_kNN, plot_genotype_hist, to_genotypes_sigmoid_round, to_genotypes_invscale_round, GenotypeConcordance, get_pops_with_k, get_ind_pop_list_from_map, get_baseline_gc, write_metric_per_epoch_to_csv
@@ -372,6 +374,11 @@ def save_ae_weights(epoch, train_directory, autoencoder, prefix=""):
 	autoencoder.save_weights(weights_file_prefix, save_format ="tf")
 	save_time = (datetime.now() - startTime).total_seconds()
 	chief_print("-------- Saving weights: {0} time: {1}".format(weights_file_prefix, save_time))
+	# TODO: rework this.
+	# "Apparently, in order to save the model, the save_model call needs to be made on all processes,
+	# but they cannot be saved to the same file, since that causes a race condition".
+	# https://www.tensorflow.org/tutorials/distribute/save_and_load
+
 
 
 if __name__ == "__main__":
@@ -379,7 +386,7 @@ if __name__ == "__main__":
 	tf.keras.backend.set_floatx('float32')
 
 	try:
-		arguments = docopt(__doc__, version='GenoAE 1.0')
+		arguments = docopt(__doc__, version='GenoCAE 1.1.0')
 	except DocoptExit:
 		chief_print("Invalid command. Run 'python run_gcae.py --help' for more information.")
 		exit(1)
@@ -388,6 +395,51 @@ if __name__ == "__main__":
 		knew = k.split('--')[-1]
 		arg=arguments.pop(k)
 		arguments[knew]=arg
+
+	gpus = tf.config.list_physical_devices(device_type="GPU")
+	chief_print("Available GPU devices:\n{}".format(gpus))
+	num_physical_gpus = len(gpus)
+	gpus = ["gpu:"+ str(i) for i in range(num_physical_gpus)]
+
+
+	## Define distribution strategies
+
+	# TODO: handle environment interaction properly!
+
+	if "SLURMD_NODENAME" in os.environ:
+
+		slurm_job = 1
+		# TODO: mind that set_tf_config() is implemented in utils.set_tf_config_berzelius_1_proc_per_gpu
+		addresses, chief, num_workers = set_tf_config()
+		isChief = os.environ["SLURMD_NODENAME"] == chief
+		os.environ["isChief"] = json.dumps(str(isChief))
+		chief_print("Number of workers: {}".format(num_workers))
+
+		if num_workers > 1 and not arguments["evaluate"]:
+			# Don't use SlurmClusterResolver: we don't always run this on an HPC cluster
+			resolver = tfd.cluster_resolver.TFConfigClusterResolver()
+			comm_opts = tfde.CommunicationOptions(implementation = tfde.CommunicationImplementation.NCCL)
+			# CollectiveCommunication is deprecated in TF 2.7
+			strat = tfd.MultiWorkerMirroredStrategy(cluster_resolver = resolver,
+			                                        communication_options = comm_opts)
+
+		else:
+			if not isChief:
+				print("Work has ended for this worker")
+				exit(0)
+			slurm_job = 0
+			strat = tfd.MirroredStrategy(devices = gpus,
+			                             cross_device_ops = tfd.NcclAllReduce())
+
+	else:
+		isChief = True
+		slurm_job = 0
+		num_workers = 1
+		strat = tfd.MirroredStrategy()
+
+	num_devices = strat.num_replicas_in_sync
+	chief_print('Number of devices: {}'.format(num_devices))
+
 
 	if arguments["trainedmodeldir"]:
 		trainedmodeldir = arguments["trainedmodeldir"]
