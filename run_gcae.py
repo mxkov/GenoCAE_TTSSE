@@ -49,6 +49,17 @@ import h5py
 import matplotlib.animation as animation
 from pathlib import Path
 
+
+def _isChief():
+	if "isChief" in os.environ:
+		if os.environ["isChief"] == "true":
+			return True
+		else:
+			return False
+	else:
+		return True
+
+
 GCAE_DIR = Path(__file__).resolve().parent
 class Autoencoder(Model):
 
