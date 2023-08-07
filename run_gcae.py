@@ -785,8 +785,11 @@ if __name__ == "__main__":
 
 		######### Create objects for tensorboard summary ###############################
 
-		train_writer = tf.summary.create_file_writer(os.path.join(train_directory, "train"))
-		valid_writer = tf.summary.create_file_writer(os.path.join(train_directory, "valid"))
+		if isChief:
+			twdir = os.path.join(train_directory, "train")
+			vwdir = os.path.join(train_directory, "valid")
+			train_writer = tf.summary.create_file_writer(twdir)
+			valid_writer = tf.summary.create_file_writer(vwdir)
 
 		######################################################
 
@@ -827,14 +830,20 @@ if __name__ == "__main__":
 				losses_t_batches.append(train_batch_loss)
 
 			train_loss_this_epoch = np.average(losses_t_batches)
-			with train_writer.as_default():
-				tf.summary.scalar('loss', train_loss_this_epoch, step = step_counter)
-				if lr_schedule:
-					tf.summary.scalar("learning_rate", optimizer._decayed_lr(var_dtype=tf.float32), step = step_counter)
-				else:
-					tf.summary.scalar("learning_rate", learning_rate, step = step_counter)
 
+			if isChief:
+				with train_writer.as_default():
+					tf.summary.scalar('loss', train_loss_this_epoch,
+ 					                  step = step_counter)
+					if lr_schedule:
+						tf.summary.scalar("learning_rate",
+						       optimizer._decayed_lr(var_dtype=tf.float32),
+						       step = step_counter)
+					else:
+						tf.summary.scalar("learning_rate", learning_rate,
+						                  step = step_counter)
 
+			# TODO: should the loss arrays only be stored by the chief? Probably.
 
 			train_time = (datetime.now() - startTime).total_seconds()
 			train_times.append(train_time)
