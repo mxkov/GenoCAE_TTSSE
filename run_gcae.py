@@ -751,35 +751,37 @@ if __name__ == "__main__":
 		chief_print("N markers: {0}".format(n_markers))
 		chief_print("")
 
-		autoencoder = Autoencoder(model_architecture, n_markers, noise_std, regularizer)
-		optimizer = tf.optimizers.Adam(learning_rate = lr_schedule)
+		with strat.scope():
+			autoencoder = Autoencoder(model_architecture, n_markers,
+			                          noise_std, regularizer)
+			optimizer = tf.optimizers.Adam(learning_rate = lr_schedule)
 
-		if resume_from:
-			chief_print("\n______________________________ Resuming training from epoch {0} ______________________________".format(resume_from))
-			weights_file_prefix = os.path.join(train_directory, "weights", str(resume_from))
-			chief_print("Reading weights from {0}".format(weights_file_prefix))
+			if resume_from:
+				chief_print("\n______________________________ Resuming training from epoch {0} ______________________________".format(resume_from))
+				weights_file_prefix = os.path.join(train_directory, "weights", str(resume_from))
+				chief_print("Reading weights from {0}".format(weights_file_prefix))
 
-			# get a single sample to run through optimization to reload weights and optimizer variables
-			input_init, targets_init, _= dg.get_train_batch(0.0, 1)
-			dg.reset_batch_index()
+				# get a single sample to run through optimization to reload weights and optimizer variables
+				input_init, targets_init, _= dg.get_train_batch(0.0, 1)
+				dg.reset_batch_index()
+				if not missing_mask_input:
+					input_init = input_init[:,:,0, np.newaxis]
+
+				# This initializes the variables used by the optimizers,
+				# as well as any stateful metric variables
+				run_optimization(autoencoder, optimizer, loss_func, input_init, targets_init)
+				autoencoder.load_weights(weights_file_prefix)
+
+			chief_print("\n______________________________ Train ______________________________")
+
+			# a small run-through of the model with just 2 samples for printing the dimensions of the layers (verbose=True)
+			chief_print("Model layers and dimensions:")
+			chief_print("-----------------------------")
+
+			input_test, targets_test, _ = dg.get_train_set(0.0)
 			if not missing_mask_input:
-				input_init = input_init[:,:,0, np.newaxis]
-
-			# This initializes the variables used by the optimizers,
-			# as well as any stateful metric variables
-			run_optimization(autoencoder, optimizer, loss_func, input_init, targets_init)
-			autoencoder.load_weights(weights_file_prefix)
-
-		chief_print("\n______________________________ Train ______________________________")
-
-		# a small run-through of the model with just 2 samples for printing the dimensions of the layers (verbose=True)
-		chief_print("Model layers and dimensions:")
-		chief_print("-----------------------------")
-
-		input_test, targets_test, _  = dg.get_train_set(0.0)
-		if not missing_mask_input:
-			input_test = input_test[:,:,0, np.newaxis]
-		output_test, encoded_data_test = autoencoder(input_test[0:2], is_training = False, verbose = True)
+				input_test = input_test[:,:,0, np.newaxis]
+			output_test, encoded_data_test = autoencoder(input_test[0:2], is_training = False, verbose = True)
 
 		######### Create objects for tensorboard summary ###############################
 
