@@ -7,6 +7,7 @@ import utils.normalization as normalization
 
 class data_generator_distrib:
 	"""docstring"""
+	# TODO: go over all attrs used, make sure they exist & are set
 
 	def __init__(self, filebase,
 	             normalization_mode="genotypewise01",
@@ -46,10 +47,20 @@ class data_generator_distrib:
 		return
 
 	# The key part (supposedly)
-	def generator(self, pref_chunk_size, training, shuffle=True):
+	def generator(self, pref_chunk_size, training=True, shuffle=True):
 		# handle data loading
 		# https://www.tensorflow.org/guide/data
 		# https://stackoverflow.com/q/68164440
+
+		if training:
+			n_samples = self.n_train_samples
+			cur_sample_idx = self.sample_idx_train[np.arange(0, n_samples)]
+		else:
+			n_samples = self.n_valid_samples
+			cur_sample_idx = self.sample_idx_valid[np.arange(0, n_samples)]
+		if shuffle:
+			cur_sample_idx = tf.random.shuffle(cur_sample_idx)
+		cur_sample_idx = tf.cast(cur_sample_idx, tf.int32)
 
 		# TODO: make sure to properly support multiple files, everywhere
 		pq_paths = sorted(glob.glob(self.filebase+"*.parquet"))
@@ -60,6 +71,25 @@ class data_generator_distrib:
 		                         use_legacy_dataset = False)
 		# OBS! might not preserve column order. rely on schema instead.
 		sch = pqds.schema
+
+		chunk_size = pref_chunk_size - pref_chunk_size % self.batch_size
+		num_chunks = np.ceil(n_samples / chunk_size)
+		chunks_read = 0
+
+		while chunks_read < num_chunks:
+
+			start = chunk_size * chunks_read
+			end   = chunk_size *(chunks_read+1)
+			chunk_idx = cur_sample_idx[start:end]
+			batches_per_chunk = np.ceil(len(chunk_idx)/self.batch_size)
+
+			# TODO: store ind_pop list as an attr?
+			inds_to_read = list(self.ind_pop_list[chunk_idx,0])
+			data = pqds.read(columns = inds_to_read,
+			                 use_threads = True,  # TODO: try without
+			                 use_pandas_metadata = False)
+			# TODO: convert this pa.Table to Numpy array
+			# TODO: batching
 
 		# TODO: the rest KEKW
 		return
