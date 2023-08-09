@@ -1,4 +1,6 @@
+import glob
 import numpy as np
+import pyarrow.parquet as pq
 import tensorflow as tf
 import utils.normalization as normalization
 
@@ -45,10 +47,21 @@ class data_generator_distrib:
 
 	# The key part (supposedly)
 	def generator(self, pref_chunk_size, training, shuffle=True):
-		# TODO
 		# handle data loading
 		# https://www.tensorflow.org/guide/data
 		# https://stackoverflow.com/q/68164440
+
+		# TODO: make sure to properly support multiple files, everywhere
+		pq_paths = sorted(glob.glob(self.filebase+"*.parquet"))
+		int32_t_MAX = 2**31-1
+		pqds = pq.ParquetDataset(path_or_paths = pq_paths,
+		                         thrift_string_size_limit = int32_t_MAX,
+		                         thrift_container_size_limit = int32_t_MAX,
+		                         use_legacy_dataset = False)
+		# OBS! might not preserve column order. rely on schema instead.
+		sch = pqds.schema
+
+		# TODO: the rest KEKW
 		return
 
 	# Another key part
