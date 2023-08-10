@@ -47,7 +47,8 @@ class data_generator_distrib:
 		return
 
 	# The key part (supposedly)
-	def generator(self, pref_chunk_size, training=True, shuffle=True):
+	def generator(self, pref_chunk_size, geno_dtype=np.float16,
+	              training=True, shuffle=True):
 		# handle data loading
 		# https://www.tensorflow.org/guide/data
 		# https://stackoverflow.com/q/68164440
@@ -70,12 +71,12 @@ class data_generator_distrib:
 		                         thrift_container_size_limit = int32_t_MAX,
 		                         use_legacy_dataset = False)
 		# OBS! might not preserve column order. rely on schema instead.
-		sch = pqds.schema
+		#sch = pqds.schema - not here imo
 
 		chunk_size = pref_chunk_size - pref_chunk_size % self.batch_size
 		num_chunks = np.ceil(n_samples / chunk_size)
-		chunks_read = 0
 
+		chunks_read = 0
 		while chunks_read < num_chunks:
 
 			start = chunk_size * chunks_read
@@ -85,14 +86,32 @@ class data_generator_distrib:
 
 			# TODO: store ind_pop list as an attr?
 			inds_to_read = list(self.ind_pop_list[chunk_idx,0])
-			data = pqds.read(columns = inds_to_read,
-			                 use_threads = True,  # TODO: try without
-			                 use_pandas_metadata = False)
-			# TODO: convert this pa.Table to Numpy array
-			# TODO: batching
+			chunk = pqds.read(columns = inds_to_read,
+			                  use_threads = True,  # TODO: try without
+			                  use_pandas_metadata = False)
+			sch   = chunk.schema
+			chunk = chunk.to_pandas(self_destruct=True).to_numpy(dtype=geno_dtype)
+			# TODO: if you use float16, other scripts should support that
+			chunk = chunk.T
+			assert chunk.shape[0] == batches_per_chunk*self.batch_size
+			assert chunk.shape[1] == self.n_markers
 
-		# TODO: the rest KEKW
-		return
+			chunks_read += 1
+
+			batches_read = 0
+			while batches_read < batches_per_chunk:
+
+				start_ = self.batch_size * batches_read
+				end_   = self.batch_size *(batches_read+1)
+				batch = chunk[start_:end_]
+
+				batch_idx  = cur_sample_idx[start_:end_]
+				batch_inds = self.ind_pop_list[batch_idx,:]
+
+				batches_read += 1
+
+				yield batch, batch_inds
+
 
 	# Another key part
 	def create_dataset(self, pref_chunk_size, shuffle=True):
