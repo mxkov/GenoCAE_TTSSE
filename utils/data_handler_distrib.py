@@ -20,6 +20,7 @@ class data_generator_distrib:
 		self.normalization_options = normalization_options
 		self.impute_missing = impute_missing
 		# maybe take & set more attrs here
+		self.tf_dataset = None
 
 		self._get_dims()
 		self._define_samples()
@@ -47,19 +48,19 @@ class data_generator_distrib:
 		return
 
 	# The key part (supposedly)
-	def generator(self, pref_chunk_size, geno_dtype=np.float16,
-	              training=True, shuffle=True):
+	def generator(self, pref_chunk_size_, geno_dtype_=np.float16,
+	              training_=True, shuffle_=True):
 		# handle data loading
 		# https://www.tensorflow.org/guide/data
 		# https://stackoverflow.com/q/68164440
 
-		if training:
+		if training_:
 			n_samples = self.n_train_samples
 			cur_sample_idx = self.sample_idx_train[np.arange(0, n_samples)]
 		else:
 			n_samples = self.n_valid_samples
 			cur_sample_idx = self.sample_idx_valid[np.arange(0, n_samples)]
-		if shuffle:
+		if shuffle_:
 			cur_sample_idx = tf.random.shuffle(cur_sample_idx)
 		cur_sample_idx = tf.cast(cur_sample_idx, tf.int32)
 
@@ -71,9 +72,10 @@ class data_generator_distrib:
 		                         thrift_container_size_limit = int32_t_MAX,
 		                         use_legacy_dataset = False)
 		# OBS! might not preserve column order. rely on schema instead.
-		#sch = pqds.schema - not here imo
+		sch0 = pqds.schema
+		# TODO: assert consistency with self.ind_pop_list
 
-		chunk_size = pref_chunk_size - pref_chunk_size % self.batch_size
+		chunk_size = pref_chunk_size_ - pref_chunk_size_ % self.batch_size
 		num_chunks = np.ceil(n_samples / chunk_size)
 
 		chunks_read = 0
@@ -90,7 +92,7 @@ class data_generator_distrib:
 			                  use_threads = True,  # TODO: try without
 			                  use_pandas_metadata = False)
 			sch   = chunk.schema
-			chunk = chunk.to_pandas(self_destruct=True).to_numpy(dtype=geno_dtype)
+			chunk = chunk.to_pandas(self_destruct=True).to_numpy(dtype=geno_dtype_)
 			# TODO: if you use float16, other scripts should support that
 			chunk = chunk.T
 			assert chunk.shape[0] == batches_per_chunk*self.batch_size
@@ -114,11 +116,33 @@ class data_generator_distrib:
 
 
 	# Another key part
-	def create_dataset(self, pref_chunk_size, shuffle=True):
-		# TODO
+	def create_tf_dataset(self, pref_chunk_size, geno_dtype=np.float16,
+	                      training=True, shuffle=True):
 		# feed self.generator to tf.data.Dataset.from_generator()
 		# possibly with TFRecord: https://stackoverflow.com/q/59458298
 		# see also https://www.tensorflow.org/guide/data_performance
-		return
+
+		gen_outshapes = (
+			tf.TensorSpec(shape=(None, self.n_markers),
+			              dtype=tf.as_dtype(geno_dtype)),
+			tf.TensorSpec(shape=(None, 2), dtype=tf.string)
+		)
+		gen_args = (pref_chunk_size, geno_dtype, training, shuffle)
+		ds = tf.data.Dataset.from_generator(self.generator,
+		                                    output_signature = gen_outshapes,
+		                                    args = gen_args)
+
+		# TODO: if training, prep norm scaler
+		# (if norm methods other than genotype-wise are applicable)
+
+		ds = ds.map(self._normalize, num_parallel_calls=tf.data.AUTOTUNE)
+
+		# TODO: stash as TFRecord?
+		# TODO: prefetch, mb batching
+
+		self.tf_dataset = ds
+
+		# TODO: apparently interleave is good for concurrent reading & mapping?
+		# can also be used to preprocess many input files? (as per docstring)
 
 	# distribute dataset: https://stackoverflow.com/q/59185729
