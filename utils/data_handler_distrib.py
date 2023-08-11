@@ -48,8 +48,7 @@ class data_generator_distrib:
 		return
 
 	# The key part (supposedly)
-	def generator(self, pref_chunk_size_, geno_dtype_=np.float16,
-	              training_=True, shuffle_=True):
+	def generator(self, pref_chunk_size_, training_=True, shuffle_=True):
 		# handle data loading
 		# https://www.tensorflow.org/guide/data
 		# https://stackoverflow.com/q/68164440
@@ -92,7 +91,7 @@ class data_generator_distrib:
 			                  use_threads = True,  # TODO: try without
 			                  use_pandas_metadata = False)
 			sch   = chunk.schema
-			chunk = chunk.to_pandas(self_destruct=True).to_numpy(dtype=geno_dtype_)
+			chunk = chunk.to_pandas(self_destruct=True).to_numpy(dtype=self.geno_dtype)
 			# TODO: if you use float16, other scripts should support that
 			chunk = chunk.T
 			assert chunk.shape[0] == batches_per_chunk*self.batch_size
@@ -115,19 +114,40 @@ class data_generator_distrib:
 				yield batch, batch_inds
 
 
+	def write_TFRecords(self, dataset, num_workers_=1, training_=True):
+		if training_:
+			mode = "train"
+			n_samples = self.n_train_samples
+		else:
+			mode = "valid"
+			n_samples = self.n_valid_samples
+
+		# At least 10 MB in each shard, but at most 10 shards per worker
+		genos_size = n_samples * self.n_markers * self.geno_dtype.itemsize
+		total_shards = min(10*num_workers_, np.ceil(genos_size*1e-7))
+
+		batches_per_shard = np.ceil(n_samples/(self.batch_size*total_shards))
+
+		for batch, batch_inds in dataset:
+			# TODO: collect enough batches & write a shard
+			pass
+
 	# Another key part
-	def create_tf_dataset(self, pref_chunk_size, geno_dtype=np.float16,
-	                      training=True, shuffle=True):
+	def create_tf_dataset(self, pref_chunk_size, num_workers=1,
+	                      geno_dtype=np.float16, training=True, shuffle=True):
 		# feed self.generator to tf.data.Dataset.from_generator()
 		# possibly with TFRecord: https://stackoverflow.com/q/59458298
 		# see also https://www.tensorflow.org/guide/data_performance
 
+		# TODO: how is validation handled with tf.data, exactly? the training arg
+
+		self.geno_dtype = geno_dtype
 		gen_outshapes = (
 			tf.TensorSpec(shape=(None, self.n_markers),
-			              dtype=tf.as_dtype(geno_dtype)),
+			              dtype=tf.as_dtype(self.geno_dtype)),
 			tf.TensorSpec(shape=(None, 2), dtype=tf.string)
 		)
-		gen_args = (pref_chunk_size, geno_dtype, training, shuffle)
+		gen_args = (pref_chunk_size, training, shuffle)
 		ds = tf.data.Dataset.from_generator(self.generator,
 		                                    output_signature = gen_outshapes,
 		                                    args = gen_args)
@@ -138,8 +158,13 @@ class data_generator_distrib:
 		ds = ds.map(self._normalize, num_parallel_calls=tf.data.AUTOTUNE)
 
 		# TODO: stash as TFRecord?
-		# TODO: prefetch, mb batching
-
+		# TODO: first, check if the TFRecord files exist,
+		#       and if yes -- whether we want to overwrite them
+		#       (in fact, check that BEFORE opening parquet)
+		self.write_TFRecords(ds, num_workers_=num_workers, training_=training)
+		
+		# TODO: then you make a new dataset out of TFRecords,
+		#       and finally assign it here:
 		self.tf_dataset = ds
 
 		# TODO: apparently interleave is good for concurrent reading & mapping?
