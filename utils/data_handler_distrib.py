@@ -1,5 +1,7 @@
 import glob
 import numpy as np
+import os
+from pathlib import Path
 import pyarrow.parquet as pq
 import tensorflow as tf
 import utils.normalization as normalization
@@ -82,7 +84,7 @@ class data_generator_distrib:
 
 			start = chunk_size * chunks_read
 			end   = chunk_size *(chunks_read+1)
-			chunk_idx = cur_sample_idx[start:end]
+			chunk_idx = cur_sample_idx[start:end,:]
 			batches_per_chunk = np.ceil(len(chunk_idx)/self.batch_size)
 
 			# TODO: store ind_pop list as an attr?
@@ -100,21 +102,25 @@ class data_generator_distrib:
 			chunks_read += 1
 
 			batches_read = 0
+			last_batch = False
 			while batches_read < batches_per_chunk:
 
 				start_ = self.batch_size * batches_read
 				end_   = self.batch_size *(batches_read+1)
 				batch = chunk[start_:end_]
+				if end_ >= chunk.shape[0]:
+					last_batch = True
 
 				batch_idx  = cur_sample_idx[start_:end_]
 				batch_inds = self.ind_pop_list[batch_idx,:]
 
 				batches_read += 1
 
-				yield batch, batch_inds
+				yield batch, batch_inds, last_batch
 
 
-	def write_TFRecords(self, dataset, num_workers_=1, training_=True):
+	def write_TFRecords(self, dataset, outprefix_,
+	                    num_workers_=1, training_=True):
 		if training_:
 			mode = "train"
 			n_samples = self.n_train_samples
@@ -122,47 +128,84 @@ class data_generator_distrib:
 			mode = "valid"
 			n_samples = self.n_valid_samples
 
+		outdir = Path(outprefix_).parent
+		if not os.path.isdir(outdir):
+			os.makedirs(outdir)
+
 		# At least 10 MB in each shard, but at most 10 shards per worker
 		genos_size = n_samples * self.n_markers * self.geno_dtype.itemsize
 		total_shards = min(10*num_workers_, np.ceil(genos_size*1e-7))
 
 		batches_per_shard = np.ceil(n_samples/(self.batch_size*total_shards))
 
-		for batch, batch_inds in dataset:
-			# TODO: collect enough batches & write a shard
-			pass
+		batch_count = 0
+		shard_count = 0
+		for batch, batch_inds, last_batch in dataset:
+			if batch_count == 0:
+				genos = batch
+				inds  = batch_inds
+			else:
+				genos = tf.concat([genos, batch], axis=0)
+				inds  = tf.concat([inds, batch_inds], axis=0)
+			batch_count += 1
+
+			if batch_count != batches_per_shard and not last_batch:
+				continue
+
+			shard_id = str(shard_count).zfill(len(str(total_shards-1)))
+			shard_filename = f"{outprefix_}_{mode}_{shard_id}.tfrecords"
+			writer = tf.io.TFRecordWriter(shard_filename)
+
+			for i in range(genos.shape[0]):
+				cur_geno = tf.cast(genos[i,:], tf.as_dtype(self.geno_dtype))
+				example = self.make_example(cur_geno, inds[i,:])
+				writer.write(example.SerializeToString())
+
+			shard_count += 1
+			writer.close()
+
+
+	def make_example(self, genotypes, indpop):
+		# TODO: make a TFRecord Example
+		return
+
 
 	# Another key part
-	def create_tf_dataset(self, pref_chunk_size, num_workers=1,
-	                      geno_dtype=np.float16, training=True, shuffle=True):
+	def create_tf_dataset(self, pref_chunk_size, outprefix,
+	                      num_workers=1, geno_dtype=np.float16,
+	                      training=True, shuffle=True, overwrite=False):
 		# feed self.generator to tf.data.Dataset.from_generator()
 		# possibly with TFRecord: https://stackoverflow.com/q/59458298
 		# see also https://www.tensorflow.org/guide/data_performance
 
 		# TODO: how is validation handled with tf.data, exactly? the training arg
 
-		self.geno_dtype = geno_dtype
-		gen_outshapes = (
-			tf.TensorSpec(shape=(None, self.n_markers),
-			              dtype=tf.as_dtype(self.geno_dtype)),
-			tf.TensorSpec(shape=(None, 2), dtype=tf.string)
-		)
-		gen_args = (pref_chunk_size, training, shuffle)
-		ds = tf.data.Dataset.from_generator(self.generator,
-		                                    output_signature = gen_outshapes,
-		                                    args = gen_args)
+		existing_tfrs = sorted(glob.glob(outprefix+"*.tfrecords"))
+		if len(existing_tfrs) == 0 or overwrite:
 
-		# TODO: if training, prep norm scaler
-		# (if norm methods other than genotype-wise are applicable)
+			self.geno_dtype = geno_dtype
+			gen_outshapes = (
+				tf.TensorSpec(shape=(None, self.n_markers),
+				              dtype=tf.as_dtype(self.geno_dtype)),
+				tf.TensorSpec(shape=(None, 2), dtype=tf.string)
+			)
+			gen_args = (pref_chunk_size, training, shuffle)
+			ds = tf.data.Dataset.from_generator(self.generator,
+			                                    output_signature=gen_outshapes,
+			                                    args=gen_args)
 
-		ds = ds.map(self._normalize, num_parallel_calls=tf.data.AUTOTUNE)
+			# TODO: if training, prep norm scaler
+			# (if norm methods other than genotype-wise are applicable)
 
-		# TODO: stash as TFRecord?
-		# TODO: first, check if the TFRecord files exist,
-		#       and if yes -- whether we want to overwrite them
-		#       (in fact, check that BEFORE opening parquet)
-		self.write_TFRecords(ds, num_workers_=num_workers, training_=training)
-		
+			ds = ds.map(self._normalize, num_parallel_calls=tf.data.AUTOTUNE)
+
+			# Apparently can't write TFRecords in parallel.
+			# TODO: make sure this works with multiprocessing (check in calling scope)
+			if "SLURM_PROCID" in os.environ and int(os.environ["SLURM_PROCID"]) == 0:
+				self.write_TFRecords(ds, outprefix,
+				                     num_workers_=num_workers,
+				                     training_=training)
+
 		# TODO: then you make a new dataset out of TFRecords,
 		#       and finally assign it here:
 		self.tf_dataset = ds
