@@ -37,14 +37,6 @@ class data_generator_distrib:
 		# TODO
 		return
 
-	def _normalize(self):
-		# TODO, as mapping
-		return
-
-	def _sparsify(self, mask, keep_fraction):
-		# TODO, as mapping
-		return
-
 	def define_validation_set(self, validation_split=0.2):
 		# TODO
 		return
@@ -119,6 +111,63 @@ class data_generator_distrib:
 				yield batch, batch_inds, last_batch
 
 
+	def _normalize(self, x, inds, last_batch):
+
+		missing = tf.where(x == 9)
+		a = tf.ones(shape=tf.shape(missing)[0], dtype=x.dtype)
+		a = tf.sparse.SparseTensor(indices=missing, values=a,
+		                           dense_shape=x.shape)
+
+		if self.impute_missing:
+			# TODO: get most_common_genos
+			b = tf.gather(self.most_common_genos, indices=missing[:,1])-9
+			b = tf.sparse.SparseTensor(indices=missing, values=b,
+			                           dense_shape=x.shape)
+			x = tf.sparse.add(x, b)
+
+		if self.normalization_mode == "genotypewise01":
+			if self.normalization_options["flip"]:
+				x = -(x-2)/2
+				if not self.impute_missing:
+					x = tf.sparse.add(x, a*(3.5-self.missing_val))
+			else:
+				x = x/2
+				if not self.impute_missing:
+					x = tf.sparse.add(x, a*(self.missing_val-4.5))
+
+		elif self.normalization_mode in ("standard", "smartPCAstyle"):
+			# TODO
+			raise NotImplementedError("Only genotypewise01 normalization "+
+			                          "method supported for now")
+
+		return x, inds, last_batch
+
+
+	def _sparsify(self, x, inds, last_batch, fraction):
+		# TODO: get fraction from data opts sparsifies
+		if not self.missing_mask_input:
+			inputs = tf.expand_dims(x, axis=-1)
+			return inputs, x, inds, last_batch
+
+		mask = tf.experimental.numpy.full(shape=x.shape, fill_value=1,
+		                                  dtype=x.dtype)
+
+		probs = tf.random.uniform(shape=x.shape, minval=0, maxval=1)
+		where_sparse = tf.where(probs < fraction)
+		b = tf.repeat(-1, tf.shape(where_sparse)[0])
+		b = tf.sparse.SparseTensor(indices=where_sparse, values=b,
+		                           dense_shape=mask.shape)
+		mask = tf.sparse.add(mask, b)
+
+		inputs = tf.math.add(tf.math.multiply(x, mask),
+		                     -1*self.missing_val*(mask-1))
+		inputs = tf.stack([inputs, mask], axis=-1)
+
+		return inputs, x, inds, last_batch
+		# TODO: do we really need to store both inputs and x? inefficient.
+		#       would need to change that in the calling scope first.
+
+
 	def write_TFRecords(self, dataset, outprefix_,
 	                    num_workers_=1, training_=True):
 		if training_:
@@ -140,13 +189,15 @@ class data_generator_distrib:
 
 		batch_count = 0
 		shard_count = 0
-		for batch, batch_inds, last_batch in dataset:
+		for batch_in, batch, batch_inds, last_batch in dataset:
 			if batch_count == 0:
-				genos = batch
-				inds  = batch_inds
+				genos_in = batch_in
+				genos    = batch
+				inds     = batch_inds
 			else:
-				genos = tf.concat([genos, batch], axis=0)
-				inds  = tf.concat([inds, batch_inds], axis=0)
+				genos_in = tf.concat([genos_in, batch_in], axis=0)
+				genos    = tf.concat([genos, batch], axis=0)
+				inds     = tf.concat([inds, batch_inds], axis=0)
 			batch_count += 1
 
 			if batch_count != batches_per_shard and not last_batch:
@@ -156,8 +207,8 @@ class data_generator_distrib:
 			shard_filename = f"{outprefix_}_{mode}_{shard_id}.tfrecords"
 			writer = tf.io.TFRecordWriter(shard_filename)
 
-			for i in range(genos.shape[0]):
-				cur_geno = tf.cast(genos[i,:], tf.as_dtype(self.geno_dtype))
+			for i in range(genos_in.shape[0]):
+				cur_geno = tf.cast(genos_in[i,:], tf.as_dtype(self.geno_dtype))
 				example = self.make_example(cur_geno, inds[i,:])
 				writer.write(example.SerializeToString())
 
@@ -187,7 +238,8 @@ class data_generator_distrib:
 			gen_outshapes = (
 				tf.TensorSpec(shape=(None, self.n_markers),
 				              dtype=tf.as_dtype(self.geno_dtype)),
-				tf.TensorSpec(shape=(None, 2), dtype=tf.string)
+				tf.TensorSpec(shape=(None, 2), dtype=tf.string),
+				tf.TensorSpec(shape=(1, 1), dtype=tf.bool)
 			)
 			gen_args = (pref_chunk_size, training, shuffle)
 			ds = tf.data.Dataset.from_generator(self.generator,
@@ -198,6 +250,8 @@ class data_generator_distrib:
 			# (if norm methods other than genotype-wise are applicable)
 
 			ds = ds.map(self._normalize, num_parallel_calls=tf.data.AUTOTUNE)
+			# Sparsifying changes dataset structure!
+			ds = ds.map(self._sparsify,  num_parallel_calls=tf.data.AUTOTUNE)
 
 			# Apparently can't write TFRecords in parallel.
 			# TODO: make sure this works with multiprocessing (check in calling scope)
