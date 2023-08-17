@@ -15,7 +15,7 @@ def _bytes_feature(value):
 def _int64_feature(value):
 	return tf.train.Feature(int64_list=tf.train.Int64List(value=[value]))
 
-def make_example(self, genos_, indpop_):
+def make_example(genos_, indpop_):
 	features_ = {
 		'len': _int64_feature(genos_.shape[0]),
 		'snp': _bytes_feature(tf.io.serialize_tensor(genos_)),
@@ -24,7 +24,7 @@ def make_example(self, genos_, indpop_):
 	}
 	return tf.train.Example(features=tf.train.Features(feature=features_))
 
-def decode_example(self, x):
+def decode_example(x, geno_dtype=np.float32):
 	features_ = {
 		'len': tf.io.FixedLenFeature([], tf.int64),
 		'snp': tf.io.FixedLenFeature([], tf.string),
@@ -33,10 +33,10 @@ def decode_example(self, x):
 	}
 	example = tf.io.parse_single_example(x, features_)
 	genos_ = tf.io.parse_tensor(example['snp'],
-	                            out_type=tf.as_dtype(self.geno_dtype))
+	                            out_type=tf.as_dtype(geno_dtype))
 	ind_ = tf.io.parse_tensor(example['ind'], out_type=tf.string)
 	pop_ = tf.io.parse_tensor(example['pop'], out_type=tf.string)
-	return genos_, ind_, pop_
+	return genos_, [ind_,pop_]
 
 
 class data_generator_distrib:
@@ -56,22 +56,47 @@ class data_generator_distrib:
 		# maybe take & set more attrs here
 		self.tf_dataset = None
 
-		self._get_dims()
+		self.get_ind_pop_list()
+		self.get_n_markers()
 		self._define_samples()
 		# no loading here
 
+	def get_ind_pop_list(self):
+		self.ind_pop_list = np.empty(shape=(0,2), dtype=str)
+		fam_files = sorted(glob.glob(self.filebase+"*.fam"))
+		for file in fam_files:
+			indpop = np.genfromtxt(file, usecols=(1,0), dtype=str)
+			self.ind_pop_list = np.concatenate((self.ind_pop_list, indpop), axis=0)
+
+	def get_n_markers(self):
+		self.n_markers = 0
+		bim_files = sorted(glob.glob(self.filebase+"*.bim"))
+		for file in bim_files:
+			self.n_markers += len(np.genfromtxt(file, usecols=(1), dtype=str))
+
 	def _define_samples(self):
-		# TODO
-		return
+		self.n_total_samples = len(self.ind_pop_list)
+		self.n_train_samples = len(self.ind_pop_list)
+		self.n_valid_samples = 0
 
-	def _get_dims(self):
-		"""Count markers and samples"""
-		# TODO
-		return
+		self.sample_idx_all   = np.arange(self.n_total_samples)
+		self.sample_idx_train = np.arange(self.n_train_samples)
+		self.sample_idx_valid = np.arange(self.n_valid_samples)
 
-	def define_validation_set(self, validation_split=0.2):
-		# TODO
-		return
+	def define_validation_set(self, validation_split=0.2, random_state=None):
+		# TODO: should be stratified by population in the general case
+		self.n_valid_samples = np.floor(self.n_total_samples)
+		self.n_train_samples = self.n_total_samples - self.n_valid_samples
+
+		np.random.seed(random_state)
+		self.sample_idx_valid = np.random.choice(self.sample_idx_all,
+		                                         size=self.n_valid_samples,
+		                                         replace=False)
+		self.sample_idx_valid = np.sort(self.sample_idx_valid)
+		train_idx = np.in1d(self.sample_idx_train, self.sample_idx_valid,
+		                    invert=True)
+		self.sample_idx_train = self.sample_idx_train[train_idx]
+
 
 	# The key part (supposedly)
 	def generator(self, pref_chunk_size_, training_=True, shuffle_=True):
@@ -97,8 +122,11 @@ class data_generator_distrib:
 		                         thrift_container_size_limit = int32_t_MAX,
 		                         use_legacy_dataset = False)
 		# OBS! might not preserve column order. rely on schema instead.
-		sch0 = pqds.schema
-		# TODO: assert consistency with self.ind_pop_list
+		pqds_schema = pqds.schema
+		inds_sch = [entry.name for entry in pqds_schema]
+		inds_fam = list(self.ind_pop_list[:,0])
+		if inds_sch != inds_fam:
+			raise ValueError("Parquet schema inconsistent with FAM files")
 
 		chunk_size = pref_chunk_size_ - pref_chunk_size_ % self.batch_size
 		num_chunks = np.ceil(n_samples / chunk_size)
@@ -111,7 +139,6 @@ class data_generator_distrib:
 			chunk_idx = cur_sample_idx[start:end,:]
 			batches_per_chunk = np.ceil(len(chunk_idx)/self.batch_size)
 
-			# TODO: store ind_pop list as an attr?
 			inds_to_read = list(self.ind_pop_list[chunk_idx,0])
 			chunk = pqds.read(columns = inds_to_read,
 			                  use_threads = True,  # TODO: try without
@@ -175,11 +202,12 @@ class data_generator_distrib:
 		return x, indpop, last_batch
 
 
-	def _sparsify(self, x, indpop, last_batch, fraction):
+	def _sparsify(self, x, indpop):
+		fraction = 0.0
 		# TODO: get fraction from data opts sparsifies
 		if not self.missing_mask_input:
 			inputs = tf.expand_dims(x, axis=-1)
-			return inputs, x, indpop, last_batch
+			return inputs, x, indpop
 
 		mask = tf.experimental.numpy.full(shape=x.shape, fill_value=1,
 		                                  dtype=x.dtype)
@@ -195,7 +223,7 @@ class data_generator_distrib:
 		                     -1*self.missing_val*(mask-1))
 		inputs = tf.stack([inputs, mask], axis=-1)
 
-		return inputs, x, indpop, last_batch
+		return inputs, x, indpop
 		# TODO: do we really need to store both inputs and x? inefficient.
 		#       would need to change that in the calling scope first.
 
@@ -252,7 +280,7 @@ class data_generator_distrib:
 
 	# Another key part
 	def create_tf_dataset(self, pref_chunk_size, outprefix,
-	                      num_workers=1, geno_dtype=np.float16,
+	                      num_workers=1, geno_dtype=np.float32,
 	                      training=True, shuffle=True, overwrite=False):
 		# feed self.generator to tf.data.Dataset.from_generator()
 		# possibly with TFRecord: https://stackoverflow.com/q/59458298
@@ -298,7 +326,8 @@ class data_generator_distrib:
 		ds = ds.interleave(tf.data.TFRecordDataset,
 		                   num_parallel_calls=tf.data.AUTOTUNE,
 		                   cycle_length=num_workers, block_length=1)
-		ds = ds.map(decode_example, num_parallel_calls=tf.data.AUTOTUNE)
+		ds = ds.map(lambda d: decode_example(d, geno_dtype=self.geno_dtype),
+		            num_parallel_calls=tf.data.AUTOTUNE)
 
 		ds = ds.prefetch(tf.data.AUTOTUNE)
 		ds = ds.batch(self.batch_size//num_workers)
