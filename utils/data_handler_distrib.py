@@ -7,6 +7,38 @@ import tensorflow as tf
 import utils.normalization as normalization
 
 
+def _bytes_feature(value):
+	if isinstance(value, type(tf.constant(0))):
+		value = value.numpy()
+	return tf.train.Feature(bytes_list=tf.train.BytesList(value=[value]))
+
+def _int64_feature(value):
+	return tf.train.Feature(int64_list=tf.train.Int64List(value=[value]))
+
+def make_example(self, genos_, indpop_):
+	features_ = {
+		'len': _int64_feature(genos_.shape[0]),
+		'snp': _bytes_feature(tf.io.serialize_tensor(genos_)),
+		'ind': _bytes_feature(tf.io.serialize_tensor(indpop_[0])),
+		'pop': _bytes_feature(tf.io.serialize_tensor(indpop_[1]))
+	}
+	return tf.train.Example(features=tf.train.Features(feature=features_))
+
+def decode_example(self, x):
+	features_ = {
+		'len': tf.io.FixedLenFeature([], tf.int64),
+		'snp': tf.io.FixedLenFeature([], tf.string),
+		'ind': tf.io.FixedLenFeature([], tf.string),
+		'pop': tf.io.FixedLenFeature([], tf.string)
+	}
+	example = tf.io.parse_single_example(x, features_)
+	genos_ = tf.io.parse_tensor(example['snp'],
+	                            out_type=tf.as_dtype(self.geno_dtype))
+	ind_ = tf.io.parse_tensor(example['ind'], out_type=tf.string)
+	pop_ = tf.io.parse_tensor(example['pop'], out_type=tf.string)
+	return genos_, ind_, pop_
+
+
 class data_generator_distrib:
 	"""docstring"""
 	# TODO: go over all attrs used, make sure they exist & are set
@@ -103,15 +135,15 @@ class data_generator_distrib:
 				if end_ >= chunk.shape[0]:
 					last_batch = True
 
-				batch_idx  = cur_sample_idx[start_:end_]
-				batch_inds = self.ind_pop_list[batch_idx,:]
+				batch_idx    = cur_sample_idx[start_:end_]
+				batch_indpop = self.ind_pop_list[batch_idx,:]
 
 				batches_read += 1
 
-				yield batch, batch_inds, last_batch
+				yield batch, batch_indpop, last_batch
 
 
-	def _normalize(self, x, inds, last_batch):
+	def _normalize(self, x, indpop, last_batch):
 
 		missing = tf.where(x == 9)
 		a = tf.ones(shape=tf.shape(missing)[0], dtype=x.dtype)
@@ -140,14 +172,14 @@ class data_generator_distrib:
 			raise NotImplementedError("Only genotypewise01 normalization "+
 			                          "method supported for now")
 
-		return x, inds, last_batch
+		return x, indpop, last_batch
 
 
-	def _sparsify(self, x, inds, last_batch, fraction):
+	def _sparsify(self, x, indpop, last_batch, fraction):
 		# TODO: get fraction from data opts sparsifies
 		if not self.missing_mask_input:
 			inputs = tf.expand_dims(x, axis=-1)
-			return inputs, x, inds, last_batch
+			return inputs, x, indpop, last_batch
 
 		mask = tf.experimental.numpy.full(shape=x.shape, fill_value=1,
 		                                  dtype=x.dtype)
@@ -163,7 +195,7 @@ class data_generator_distrib:
 		                     -1*self.missing_val*(mask-1))
 		inputs = tf.stack([inputs, mask], axis=-1)
 
-		return inputs, x, inds, last_batch
+		return inputs, x, indpop, last_batch
 		# TODO: do we really need to store both inputs and x? inefficient.
 		#       would need to change that in the calling scope first.
 
@@ -182,6 +214,9 @@ class data_generator_distrib:
 			os.makedirs(outdir)
 
 		# At least 10 MB in each shard, but at most 10 shards per worker
+		# TODO: rethink this. we might end up with A LOT more shards.
+		#       how about you remove this upper limit for now
+		#       and reinstate it later if needed
 		genos_size = n_samples * self.n_markers * self.geno_dtype.itemsize
 		total_shards = min(10*num_workers_, np.ceil(genos_size*1e-7))
 
@@ -189,15 +224,13 @@ class data_generator_distrib:
 
 		batch_count = 0
 		shard_count = 0
-		for batch_in, batch, batch_inds, last_batch in dataset:
+		for batch, batch_indpop, last_batch in dataset:
 			if batch_count == 0:
-				genos_in = batch_in
 				genos    = batch
-				inds     = batch_inds
+				indpop   = batch_indpop
 			else:
-				genos_in = tf.concat([genos_in, batch_in], axis=0)
 				genos    = tf.concat([genos, batch], axis=0)
-				inds     = tf.concat([inds, batch_inds], axis=0)
+				indpop   = tf.concat([indpop, batch_indpop], axis=0)
 			batch_count += 1
 
 			if batch_count != batches_per_shard and not last_batch:
@@ -206,19 +239,15 @@ class data_generator_distrib:
 			shard_id = str(shard_count).zfill(len(str(total_shards-1)))
 			shard_filename = f"{outprefix_}_{mode}_{shard_id}.tfrecords"
 			writer = tf.io.TFRecordWriter(shard_filename)
+			# TODO: compression maybe?
 
-			for i in range(genos_in.shape[0]):
-				cur_geno = tf.cast(genos_in[i,:], tf.as_dtype(self.geno_dtype))
-				example = self.make_example(cur_geno, inds[i,:])
+			for i in range(genos.shape[0]):
+				cur_geno = tf.cast(genos[i,:], tf.as_dtype(self.geno_dtype))
+				example = make_example(cur_geno, indpop[i,:])
 				writer.write(example.SerializeToString())
 
 			shard_count += 1
 			writer.close()
-
-
-	def make_example(self, genotypes, indpop):
-		# TODO: make a TFRecord Example
-		return
 
 
 	# Another key part
@@ -231,8 +260,8 @@ class data_generator_distrib:
 
 		# TODO: how is validation handled with tf.data, exactly? the training arg
 
-		existing_tfrs = sorted(glob.glob(outprefix+"*.tfrecords"))
-		if len(existing_tfrs) == 0 or overwrite:
+		existing_tfr_files = sorted(glob.glob(outprefix+"*.tfrecords"))
+		if len(existing_tfr_files) == 0 or overwrite:
 
 			self.geno_dtype = geno_dtype
 			gen_outshapes = (
@@ -242,6 +271,9 @@ class data_generator_distrib:
 				tf.TensorSpec(shape=(1, 1), dtype=tf.bool)
 			)
 			gen_args = (pref_chunk_size, training, shuffle)
+			# TODO: can't you, like... shard it right away? instead of batching?
+			#       note that shards cannot be larger than chunks though
+			#       (assuming no dtype shenanigans)
 			ds = tf.data.Dataset.from_generator(self.generator,
 			                                    output_signature=gen_outshapes,
 			                                    args=gen_args)
@@ -250,8 +282,6 @@ class data_generator_distrib:
 			# (if norm methods other than genotype-wise are applicable)
 
 			ds = ds.map(self._normalize, num_parallel_calls=tf.data.AUTOTUNE)
-			# Sparsifying changes dataset structure!
-			ds = ds.map(self._sparsify,  num_parallel_calls=tf.data.AUTOTUNE)
 
 			# Apparently can't write TFRecords in parallel.
 			# TODO: make sure this works with multiprocessing (check in calling scope)
@@ -260,11 +290,21 @@ class data_generator_distrib:
 				                     num_workers_=num_workers,
 				                     training_=training)
 
-		# TODO: then you make a new dataset out of TFRecords,
-		#       and finally assign it here:
-		self.tf_dataset = ds
+		current_tfr_files = sorted(glob.glob(outprefix+"*.tfrecords"))
+		ds = tf.data.from_tensor_slices(filenames=current_tfr_files)
 
-		# TODO: apparently interleave is good for concurrent reading & mapping?
-		# can also be used to preprocess many input files? (as per docstring)
+		worker_id = int(os.environ["SLURM_PROCID"])
+		ds = ds.shard(num_workers, worker_id)
+		ds = ds.interleave(tf.data.TFRecordDataset,
+		                   num_parallel_calls=tf.data.AUTOTUNE,
+		                   cycle_length=num_workers, block_length=1)
+		ds = ds.map(decode_example, num_parallel_calls=tf.data.AUTOTUNE)
+
+		ds = ds.prefetch(tf.data.AUTOTUNE)
+		ds = ds.batch(self.batch_size//num_workers)
+		# Sparsifying changes dataset structure!
+		ds = ds.map(self._sparsify,  num_parallel_calls=tf.data.AUTOTUNE)
+
+		self.tf_dataset = ds
 
 	# distribute dataset: https://stackoverflow.com/q/59185729
