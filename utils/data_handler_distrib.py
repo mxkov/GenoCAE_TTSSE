@@ -83,6 +83,7 @@ class data_generator_distrib:
 		self.sample_idx_train = np.arange(self.n_train_samples)
 		self.sample_idx_valid = np.arange(self.n_valid_samples)
 
+
 	def define_validation_set(self, validation_split=0.2, random_state=None):
 		# TODO: should be stratified by population in the general case
 		self.n_valid_samples = np.floor(self.n_total_samples*validation_split)
@@ -98,7 +99,71 @@ class data_generator_distrib:
 		self.sample_idx_train = self.sample_idx_train[train_idx]
 
 
-	# The key part (supposedly)
+	# The most important method to be called from outer scope
+	def create_tf_dataset(self, batch_size, outprefix,
+	                      num_workers=1, geno_dtype=np.float32, training=True,
+	                      pref_chunk_size=None, shuffle=True,
+	                      overwrite=False):
+		# TODO: how is validation handled with tf.data, exactly? the training arg
+
+		self.batch_size  = batch_size
+		self.outprefix   = outprefix
+		self.num_workers = num_workers
+		self.geno_dtype  = geno_dtype
+		self.training    = training
+
+		existing_tfr_files = sorted(glob.glob(self.outprefix+"*.tfrecords"))
+		if len(existing_tfr_files) == 0 or overwrite:
+			self.parquet_to_tfrecords(pref_chunk_size_=pref_chunk_size,
+			                          shuffle_=shuffle)
+
+		current_tfr_files = sorted(glob.glob(self.outprefix+"*.tfrecords"))
+		ds = tf.data.from_tensor_slices(filenames=current_tfr_files)
+
+		worker_id = int(os.environ["SLURM_PROCID"])
+		ds = ds.shard(self.num_workers, worker_id)
+		ds = ds.interleave(tf.data.TFRecordDataset,
+		                   num_parallel_calls=tf.data.AUTOTUNE,
+		                   cycle_length=self.num_workers, block_length=1)
+		ds = ds.map(lambda d: decode_example(d, geno_dtype=self.geno_dtype),
+		            num_parallel_calls=tf.data.AUTOTUNE)
+
+		ds = ds.prefetch(tf.data.AUTOTUNE)
+		ds = ds.batch(self.batch_size//self.num_workers)
+		# Sparsifying changes dataset structure!
+		ds = ds.map(self._sparsify,  num_parallel_calls=tf.data.AUTOTUNE)
+
+		self.tf_dataset = ds
+		# distribute dataset: https://stackoverflow.com/q/59185729
+
+
+	def parquet_to_tfrecords(self, pref_chunk_size_=None,
+	                         training_=True, shuffle_=True):
+		gen_outshapes = (
+			tf.TensorSpec(shape=(None, self.n_markers),
+			              dtype=tf.as_dtype(self.geno_dtype)),
+			tf.TensorSpec(shape=(None, 2), dtype=tf.string),
+			tf.TensorSpec(shape=(1, 1), dtype=tf.bool)
+		)
+		gen_args = (pref_chunk_size_, training_, shuffle_)
+		# TODO: can't you, like... shard it right away? instead of batching?
+		#       note that shards cannot be larger than chunks though
+		#       (assuming no dtype shenanigans)
+		ds = tf.data.Dataset.from_generator(self.generator_from_parquet,
+		                                    output_signature=gen_outshapes,
+		                                    args=gen_args)
+
+		# TODO: if training, prep norm scaler
+		# (if norm methods other than genotype-wise are applicable)
+
+		ds = ds.map(self._normalize, num_parallel_calls=tf.data.AUTOTUNE)
+
+		# Apparently can't write TFRecords in parallel.
+		# TODO: make sure this works with multiprocessing (check in calling scope)
+		if "SLURM_PROCID" in os.environ and int(os.environ["SLURM_PROCID"])==0:
+			self.write_TFRecords(ds)
+
+
 	def generator_from_parquet(self, pref_chunk_size_,
 	                           training_=True, shuffle_=True):
 		# handle data loading
@@ -276,69 +341,3 @@ class data_generator_distrib:
 
 			shard_count += 1
 			writer.close()
-
-
-	def parquet_to_tfrecords(self, pref_chunk_size_=None,
-	                         training_=True, shuffle_=True):
-		gen_outshapes = (
-			tf.TensorSpec(shape=(None, self.n_markers),
-			              dtype=tf.as_dtype(self.geno_dtype)),
-			tf.TensorSpec(shape=(None, 2), dtype=tf.string),
-			tf.TensorSpec(shape=(1, 1), dtype=tf.bool)
-		)
-		gen_args = (pref_chunk_size_, training_, shuffle_)
-		# TODO: can't you, like... shard it right away? instead of batching?
-		#       note that shards cannot be larger than chunks though
-		#       (assuming no dtype shenanigans)
-		ds = tf.data.Dataset.from_generator(self.generator_from_parquet,
-		                                    output_signature=gen_outshapes,
-		                                    args=gen_args)
-
-		# TODO: if training, prep norm scaler
-		# (if norm methods other than genotype-wise are applicable)
-
-		ds = ds.map(self._normalize, num_parallel_calls=tf.data.AUTOTUNE)
-
-		# Apparently can't write TFRecords in parallel.
-		# TODO: make sure this works with multiprocessing (check in calling scope)
-		if "SLURM_PROCID" in os.environ and int(os.environ["SLURM_PROCID"])==0:
-			self.write_TFRecords(ds)
-
-
-	# Another key part
-	def create_tf_dataset(self, batch_size, outprefix,
-	                      num_workers=1, geno_dtype=np.float32, training=True,
-	                      pref_chunk_size=None, shuffle=True,
-	                      overwrite=False):
-		# TODO: how is validation handled with tf.data, exactly? the training arg
-
-		self.batch_size  = batch_size
-		self.outprefix   = outprefix
-		self.num_workers = num_workers
-		self.geno_dtype  = geno_dtype
-		self.training    = training
-
-		existing_tfr_files = sorted(glob.glob(self.outprefix+"*.tfrecords"))
-		if len(existing_tfr_files) == 0 or overwrite:
-			self.parquet_to_tfrecords(pref_chunk_size_=pref_chunk_size,
-			                          shuffle_=shuffle)
-
-		current_tfr_files = sorted(glob.glob(self.outprefix+"*.tfrecords"))
-		ds = tf.data.from_tensor_slices(filenames=current_tfr_files)
-
-		worker_id = int(os.environ["SLURM_PROCID"])
-		ds = ds.shard(self.num_workers, worker_id)
-		ds = ds.interleave(tf.data.TFRecordDataset,
-		                   num_parallel_calls=tf.data.AUTOTUNE,
-		                   cycle_length=self.num_workers, block_length=1)
-		ds = ds.map(lambda d: decode_example(d, geno_dtype=self.geno_dtype),
-		            num_parallel_calls=tf.data.AUTOTUNE)
-
-		ds = ds.prefetch(tf.data.AUTOTUNE)
-		ds = ds.batch(self.batch_size//self.num_workers)
-		# Sparsifying changes dataset structure!
-		ds = ds.map(self._sparsify,  num_parallel_calls=tf.data.AUTOTUNE)
-
-		self.tf_dataset = ds
-
-	# distribute dataset: https://stackoverflow.com/q/59185729
