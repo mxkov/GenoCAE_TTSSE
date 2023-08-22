@@ -1,8 +1,9 @@
 import glob
 import numpy as np
 import os
-from pathlib import Path
+import pathlib
 import pyarrow.parquet as pq
+import scipy
 import tensorflow as tf
 import utils.normalization as normalization
 
@@ -41,12 +42,11 @@ def decode_example(x, geno_dtype=np.float32):
 
 class data_generator_distrib:
 	"""docstring"""
-	# TODO: go over all attrs used, make sure they exist & are set
 
 	def __init__(self, filebase,
 	             normalization_mode="genotypewise01",
 	             normalization_options={"flip": False,
-	                                    "missing_val": 0.0},
+	                                    "missing_val": 9},
 	             impute_missing=True):
 		self.filebase = filebase
 		self.missing_val = normalization_options["missing_val"]
@@ -56,19 +56,18 @@ class data_generator_distrib:
 		# maybe take & set more attrs here
 		self.tf_dataset = None
 
-		self.get_ind_pop_list()
-		self.get_n_markers()
+		self._get_ind_pop_list()
+		self._get_n_markers()
 		self._define_samples()
-		# no loading here
 
-	def get_ind_pop_list(self):
+	def _get_ind_pop_list(self):
 		self.ind_pop_list = np.empty(shape=(0,2), dtype=str)
 		fam_files = sorted(glob.glob(self.filebase+"*.fam"))
 		for file in fam_files:
 			indpop = np.genfromtxt(file, usecols=(1,0), dtype=str)
-			self.ind_pop_list = np.concatenate((self.ind_pop_list, indpop), axis=0)
+			self.ind_pop_list=np.concatenate((self.ind_pop_list,indpop), axis=0)
 
-	def get_n_markers(self):
+	def _get_n_markers(self):
 		self.n_markers = 0
 		bim_files = sorted(glob.glob(self.filebase+"*.bim"))
 		for file in bim_files:
@@ -101,16 +100,19 @@ class data_generator_distrib:
 
 	# The most important method to be called from outer scope
 	def create_tf_dataset(self, batch_size, outprefix,
-	                      num_workers=1, geno_dtype=np.float32, training=True,
+	                      geno_dtype=np.float32, sparsifies=None,
+	                      num_workers=1, training=True,
 	                      pref_chunk_size=None, shuffle=True,
 	                      overwrite=False):
 		# TODO: how is validation handled with tf.data, exactly? the training arg
 
 		self.batch_size  = batch_size
 		self.outprefix   = outprefix
-		self.num_workers = num_workers
 		self.geno_dtype  = geno_dtype
+		self.sparsifies  = sparsifies
+		self.num_workers = num_workers
 		self.training    = training
+		# TODO: could set one dtype for tfrecords and another for loading them
 
 		existing_tfr_files = sorted(glob.glob(self.outprefix+"*.tfrecords"))
 		if len(existing_tfr_files) == 0 or overwrite:
@@ -244,8 +246,9 @@ class data_generator_distrib:
 		                           dense_shape=x.shape)
 
 		if self.impute_missing:
-			# TODO: get most_common_genos
-			b = tf.gather(self.most_common_genos, indices=missing[:,1])-9
+			most_common_genos = self._get_most_common_genotypes(x)
+			# TODO: this is batch level.
+			b = tf.gather(most_common_genos, indices=missing[:,1])-9
 			b = tf.sparse.SparseTensor(indices=missing, values=b,
 			                           dense_shape=x.shape)
 			x = tf.sparse.add(x, b)
@@ -268,16 +271,19 @@ class data_generator_distrib:
 		return x, indpop, last_batch
 
 
+	def _get_most_common_genotypes(self, x_):
+		return scipy.stats.mode(x_).mode[0]
+
+
 	def _sparsify(self, x, indpop):
-		fraction = 0.0
-		# TODO: get fraction from data opts sparsifies
-		if not self.missing_mask_input:
+
+		if self.sparsifies is None:
 			inputs = tf.expand_dims(x, axis=-1)
 			return inputs, x, indpop
 
 		mask = tf.experimental.numpy.full(shape=x.shape, fill_value=1,
 		                                  dtype=x.dtype)
-
+		fraction = np.random.choice(self.sparsifies)
 		probs = tf.random.uniform(shape=x.shape, minval=0, maxval=1)
 		where_sparse = tf.where(probs < fraction)
 		b = tf.repeat(-1, tf.shape(where_sparse)[0])
@@ -290,8 +296,6 @@ class data_generator_distrib:
 		inputs = tf.stack([inputs, mask], axis=-1)
 
 		return inputs, x, indpop
-		# TODO: do we really need to store both inputs and x? inefficient.
-		#       would need to change that in the calling scope first.
 
 
 	def write_TFRecords(self, dataset):
@@ -302,7 +306,7 @@ class data_generator_distrib:
 			mode = "valid"
 			n_samples = self.n_valid_samples
 
-		outdir = Path(self.outprefix).parent
+		outdir = pathlib.Path(self.outprefix).parent
 		if not os.path.isdir(outdir):
 			os.makedirs(outdir)
 
