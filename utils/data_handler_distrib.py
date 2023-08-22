@@ -101,17 +101,18 @@ class data_generator_distrib:
 	# The most important method to be called from outer scope
 	def create_tf_dataset(self, batch_size, outprefix,
 	                      geno_dtype=np.float32, sparsifies=None,
-	                      num_workers=1, training=True,
+	                      num_workers=1, training=True, batch_shards=False,
 	                      pref_chunk_size=None, shuffle=True,
 	                      overwrite=False):
 		# TODO: how is validation handled with tf.data, exactly? the training arg
 
-		self.batch_size  = batch_size
-		self.outprefix   = outprefix
-		self.geno_dtype  = geno_dtype
-		self.sparsifies  = sparsifies
-		self.num_workers = num_workers
-		self.training    = training
+		self.batch_size   = batch_size
+		self.outprefix    = outprefix
+		self.geno_dtype   = geno_dtype
+		self.sparsifies   = sparsifies
+		self.num_workers  = num_workers
+		self.training     = training
+		self.batch_shards = batch_shards
 		# TODO: could set one dtype for tfrecords and another for loading them
 
 		existing_tfr_files = sorted(glob.glob(self.outprefix+"*.tfrecords"))
@@ -139,18 +140,18 @@ class data_generator_distrib:
 		# distribute dataset: https://stackoverflow.com/q/59185729
 
 
-	def parquet_to_tfrecords(self, pref_chunk_size_=None,
-	                         training_=True, shuffle_=True):
+	def parquet_to_tfrecords(self, pref_chunk_size_=None, shuffle_=True):
+		if pref_chunk_size_ is None:
+			# TODO: auto select
+			pass
+
 		gen_outshapes = (
 			tf.TensorSpec(shape=(None, self.n_markers),
 			              dtype=tf.as_dtype(self.geno_dtype)),
 			tf.TensorSpec(shape=(None, 2), dtype=tf.string),
 			tf.TensorSpec(shape=(1, 1), dtype=tf.bool)
 		)
-		gen_args = (pref_chunk_size_, training_, shuffle_)
-		# TODO: can't you, like... shard it right away? instead of batching?
-		#       note that shards cannot be larger than chunks though
-		#       (assuming no dtype shenanigans)
+		gen_args = (pref_chunk_size_, self.training, shuffle_)
 		ds = tf.data.Dataset.from_generator(self.generator_from_parquet,
 		                                    output_signature=gen_outshapes,
 		                                    args=gen_args)
@@ -166,8 +167,7 @@ class data_generator_distrib:
 			self.write_TFRecords(ds)
 
 
-	def generator_from_parquet(self, pref_chunk_size_,
-	                           training_=True, shuffle_=True):
+	def generator_from_parquet(self, pref_chunk_size_, training_, shuffle_):
 		# handle data loading
 		# https://www.tensorflow.org/guide/data
 		# https://stackoverflow.com/q/68164440
@@ -181,6 +181,11 @@ class data_generator_distrib:
 		if shuffle_:
 			cur_sample_idx = tf.random.shuffle(cur_sample_idx)
 		cur_sample_idx = tf.cast(cur_sample_idx, tf.int32)
+
+		if self.batch_shards:
+			gen_batch_size = self.batch_size
+		else:
+			gen_batch_size = pref_chunk_size_
 
 		# TODO: make sure to properly support multiple files, everywhere
 		pq_paths = sorted(glob.glob(self.filebase+"*.parquet"))
@@ -196,7 +201,7 @@ class data_generator_distrib:
 		if inds_sch != inds_fam:
 			raise ValueError("Parquet schema inconsistent with FAM files")
 
-		chunk_size = pref_chunk_size_ - pref_chunk_size_ % self.batch_size
+		chunk_size = pref_chunk_size_ - pref_chunk_size_ % gen_batch_size
 		num_chunks = np.ceil(n_samples / chunk_size)
 
 		chunks_read = 0
@@ -205,7 +210,7 @@ class data_generator_distrib:
 			start = chunk_size * chunks_read
 			end   = chunk_size *(chunks_read+1)
 			chunk_idx = cur_sample_idx[start:end,:]
-			batches_per_chunk = np.ceil(len(chunk_idx)/self.batch_size)
+			batches_per_chunk = np.ceil(len(chunk_idx)/gen_batch_size)
 
 			inds_to_read = list(self.ind_pop_list[chunk_idx,0])
 			chunk = pqds.read(columns = inds_to_read,
@@ -215,7 +220,7 @@ class data_generator_distrib:
 			chunk = chunk.to_pandas(self_destruct=True).to_numpy(dtype=self.geno_dtype)
 			# TODO: if you use float16, other scripts should support that
 			chunk = chunk.T
-			assert chunk.shape[0] == batches_per_chunk*self.batch_size
+			assert chunk.shape[0] == batches_per_chunk*gen_batch_size
 			assert chunk.shape[1] == self.n_markers
 
 			chunks_read += 1
@@ -224,8 +229,8 @@ class data_generator_distrib:
 			last_batch = False
 			while batches_read < batches_per_chunk:
 
-				start_ = self.batch_size * batches_read
-				end_   = self.batch_size *(batches_read+1)
+				start_ = gen_batch_size * batches_read
+				end_   = gen_batch_size *(batches_read+1)
 				batch = chunk[start_:end_]
 				if end_ >= chunk.shape[0]:
 					last_batch = True
@@ -317,7 +322,10 @@ class data_generator_distrib:
 		genos_size = n_samples * self.n_markers * self.geno_dtype.itemsize
 		total_shards = min(10*self.num_workers, np.ceil(genos_size*1e-7))
 
-		batches_per_shard = np.ceil(n_samples/(self.batch_size*total_shards))
+		if self.batch_shards:
+			batches_per_shard=np.ceil(n_samples/(self.batch_size*total_shards))
+		else:
+			batches_per_shard=1
 
 		batch_count = 0
 		shard_count = 0
