@@ -44,17 +44,17 @@ class data_generator_distrib:
 	"""docstring"""
 
 	def __init__(self, filebase,
+	             missing_mask=True, impute_missing=True,
 	             normalization_mode="genotypewise01",
 	             normalization_options={"flip": False,
-	                                    "missing_val": 9},
-	             impute_missing=True):
+	                                    "missing_val": -1.0}):
 		self.filebase = filebase
+		self.missing_mask = missing_mask
+		self.impute_missing = impute_missing
 		self.missing_val = normalization_options["missing_val"]
 		self.normalization_mode = normalization_mode
 		self.normalization_options = normalization_options
-		self.impute_missing = impute_missing
 		# maybe take & set more attrs here
-		self.tf_dataset = None
 
 		self._get_ind_pop_list()
 		self._get_n_markers()
@@ -133,11 +133,9 @@ class data_generator_distrib:
 
 		ds = ds.prefetch(tf.data.AUTOTUNE)
 		ds = ds.batch(self.batch_size//self.num_workers)
-		# Sparsifying changes dataset structure!
-		ds = ds.map(self._sparsify,  num_parallel_calls=tf.data.AUTOTUNE)
+		ds = ds.map(self._mask_and_sparsify, num_parallel_calls=tf.data.AUTOTUNE)
 
-		self.tf_dataset = ds
-		# distribute dataset: https://stackoverflow.com/q/59185729
+		return ds
 
 
 	def parquet_to_tfrecords(self, pref_chunk_size_=None, shuffle_=True):
@@ -244,6 +242,7 @@ class data_generator_distrib:
 
 
 	def _normalize(self, x, indpop, last_batch):
+		"""normalize and insert missing value"""
 
 		missing = tf.where(x == 9)
 		a = tf.ones(shape=tf.shape(missing)[0], dtype=x.dtype)
@@ -263,13 +262,13 @@ class data_generator_distrib:
 				x = -(x-2)/2
 				if not self.impute_missing:
 					x = tf.sparse.add(x, a*(3.5-self.missing_val))
+					# TODO: do we flip the missing value here too?
 			else:
 				x = x/2
 				if not self.impute_missing:
 					x = tf.sparse.add(x, a*(self.missing_val-4.5))
 
 		elif self.normalization_mode in ("standard", "smartPCAstyle"):
-			# TODO
 			raise NotImplementedError("Only genotypewise01 normalization "+
 			                          "method supported for now")
 
@@ -280,27 +279,47 @@ class data_generator_distrib:
 		return scipy.stats.mode(x_).mode[0]
 
 
-	def _sparsify(self, x, indpop):
+	def _mask_and_sparsify(self, x, indpop):
 
-		if self.sparsifies is None:
+		sparsify = False
+		if self.sparsifies is not None and len(self.sparsifies)>0:
+			sparsify_fraction = np.random.choice(self.sparsifies)
+			if sparsify_fraction > 0.0:
+				sparsify = True
+
+		if not sparsify and not self.missing_mask:
 			inputs = tf.expand_dims(x, axis=-1)
 			return inputs, x, indpop
 
-		mask = tf.experimental.numpy.full(shape=x.shape, fill_value=1,
-		                                  dtype=x.dtype)
-		fraction = np.random.choice(self.sparsifies)
-		probs = tf.random.uniform(shape=x.shape, minval=0, maxval=1)
-		where_sparse = tf.where(probs < fraction)
-		b = tf.repeat(-1, tf.shape(where_sparse)[0])
-		b = tf.sparse.SparseTensor(indices=where_sparse, values=b,
-		                           dense_shape=mask.shape)
-		mask = tf.sparse.add(mask, b)
+		inputs = tf.identity(x)
+		mask   = tf.experimental.numpy.full(shape=x.shape, fill_value=1,
+		                                    dtype=x.dtype)
 
-		inputs = tf.math.add(tf.math.multiply(x, mask),
-		                     -1*self.missing_val*(mask-1))
-		inputs = tf.stack([inputs, mask], axis=-1)
+		if sparsify:
+			probs = tf.random.uniform(shape=x.shape, minval=0, maxval=1)
+			where_sparse = tf.where(probs < sparsify_fraction)
+			delta_s = tf.repeat(-1, tf.shape(where_sparse)[0])
+			delta_s = tf.sparse.SparseTensor(indices=where_sparse,
+			                                 values=delta_s,
+			                                 dense_shape=mask.shape)
+			mask = tf.sparse.add(mask, delta_s)
+			inputs = tf.math.add(tf.math.multiply(inputs, mask),
+			                     self.missing_val*(1-mask))
+
+		if self.missing_mask:
+			if not self.impute_missing:
+				where_missing = tf.where(x == self.missing_val)
+				delta_m = tf.repeat(0, tf.shape(where_missing)[0])
+				delta_m = tf.sparse.SparseTensor(indices=where_missing,
+				                                 values=delta_m,
+				                                 dense_shape=mask.shape)
+				mask = tf.sparse.sparse_dense_matmul(delta_m, mask)
+			inputs = tf.stack([inputs, mask], axis=-1)
+		else:
+			inputs = tf.expand_dims(inputs, axis=-1)
 
 		return inputs, x, indpop
+		# TODO: mind that x are targets. mb make this clearer in the code.
 
 
 	def write_TFRecords(self, dataset):
