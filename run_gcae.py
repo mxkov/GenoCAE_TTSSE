@@ -34,6 +34,7 @@ import tensorflow.distribute as tfd
 import tensorflow.distribute.experimental as tfde
 from tensorflow.keras import Model, layers
 from datetime import datetime
+from utils.data_handler_distrib import data_generator_distrib # TODO: look into reimplementing all these below as well:
 from utils.data_handler import get_saved_epochs, get_projected_epochs, write_h5, read_h5, get_coords_by_pop, data_generator_ae, convex_hull_error, f1_score_kNN, plot_genotype_hist, to_genotypes_sigmoid_round, to_genotypes_invscale_round, GenotypeConcordance, get_pops_with_k, get_ind_pop_list_from_map, get_baseline_gc, write_metric_per_epoch_to_csv
 from utils.visualization import plot_coords_by_superpop, plot_clusters_by_superpop, plot_coords, plot_coords_by_pop, make_animation, write_f1_scores_to_csv
 import utils.visualization
@@ -341,6 +342,11 @@ def run_optimization(model, optimizer, loss_function, input, targets):
 	return loss_value
 
 
+def get_distrib_losses(autoencoder, loss_func, inputs, targets):
+	# TODO
+	return 0.0
+
+
 def get_batches(n_samples, batch_size):
 	n_batches = n_samples // batch_size
 
@@ -377,10 +383,13 @@ def save_ae_weights(epoch, train_directory, autoencoder, prefix=""):
 	autoencoder.save_weights(weights_file_prefix, save_format ="tf")
 	save_time = (datetime.now() - startTime).total_seconds()
 	chief_print("-------- Saving weights: {0} time: {1}".format(weights_file_prefix, save_time))
-	# TODO: rework this.
+
+def save_ae_weights_distrib(epoch, train_directory, model, prefix=""):
+	# TODO: rework the function above ^.
 	# "Apparently, in order to save the model, the save_model call needs to be made on all processes,
 	# but they cannot be saved to the same file, since that causes a race condition".
 	# https://www.tensorflow.org/tutorials/distribute/save_and_load
+	pass
 
 
 
@@ -525,7 +534,7 @@ if __name__ == "__main__":
 
 	if "sparsifies" in data_opts.keys():
 		sparsify_input = True
-		missing_mask_input = True
+		missing_mask_input = True # TODO: make this a separate option
 		n_input_channels = 2
 		sparsifies = data_opts["sparsifies"]
 
@@ -609,11 +618,17 @@ if __name__ == "__main__":
 				exit(1)
 
 	else:
-		dg = data_generator_ae(data_prefix,
-		                       normalization_mode = norm_mode,
-		                       normalization_options = norm_opts,
-		                       impute_missing = fill_missing)
+		dg = data_generator_distrib(data_prefix,
+		                            missing_mask = missing_mask_input,
+		                            impute_missing = fill_missing,
+		                            normalization_mode = norm_mode,
+		                            normalization_options = norm_opts)
 		n_markers = copy.deepcopy(dg.n_markers)
+
+		tfr_dir = os.path.join(Path(data_prefix).resolve().parent, "TFRecords")
+		if not os.path.isdir(tfr_dir):
+			os.makedirs(tfr_dir)
+		tfr_prefix = os.path.join(tfr_dir, Path(data_prefix).resolve().name)
 
 		loss_def = train_opts["loss"]
 		loss_class = getattr(eval(loss_def["module"]), loss_def["class"])
@@ -634,6 +649,9 @@ if __name__ == "__main__":
 			:param genos: (n_samples x n_markers) genotypes
 			:return: boolean mask of the same shape as genos
 			'''
+			# TODO: maybe we don't need this.
+			#       just get a mask from dg, then extract it into a sparse tensor and multiply by genos.
+			#       but then we'll need to rethink how we set missing_mask_input.
 			orig_nonmissing_mask = tf.not_equal(genos, float(norm_opts["missing_val"]))
 
 			return orig_nonmissing_mask
@@ -697,31 +715,41 @@ if __name__ == "__main__":
 		except:
 			resume_from = False
 
-		dg.define_validation_set(validation_split = validation_split)
-		input_valid, targets_valid, _  = dg.get_valid_set(0.0)
-
-		# if we do not have missing mask input, remeove that dimension/channel from the input that data generator returns
-		if not missing_mask_input:
-			input_valid = input_valid[:,:,0, np.newaxis]
+		ds_args = {"batch_size" : batch_size,
+		           "outprefix"  : tfr_prefix,
+		           "valid_split": validation_split,
+		           "sparsifies" : sparsifies,
+		           "num_workers": num_workers} # TODO: auto chunk size!
+		dg.create_tf_dataset(**ds_args)
 
 		n_unique_train_samples = copy.deepcopy(dg.n_train_samples)
 		n_valid_samples = copy.deepcopy(dg.n_valid_samples)
 
-		assert n_valid_samples == len(input_valid)
-		assert n_valid_samples == len(targets_valid)
+		dg.dataset_train=strat.experimental_distribute_dataset(dg.dataset_train)
+		if dg.dataset_valid is not None:
+			dg.dataset_valid=strat.experimental_distribute_dataset(dg.dataset_valid)
 
-		if "n_samples" in train_opts.keys() and int(train_opts["n_samples"]) > 0:
-			n_train_samples = int(train_opts["n_samples"])
-		else:
-			n_train_samples = n_unique_train_samples
+		# TODO: i don't understand what this commented block is for,
+		#       will prob remove or reimplement later
+		#if "n_samples" in train_opts.keys() and int(train_opts["n_samples"]) > 0:
+		#	n_train_samples = int(train_opts["n_samples"])
+		#else:
+		#	n_train_samples = n_unique_train_samples
+		n_train_samples = copy.deepcopy(n_unique_train_samples)
 
 		batch_size_valid = batch_size
-		n_train_batches, n_train_samples_last_batch = get_batches(n_train_samples, batch_size)
-		n_valid_batches, n_valid_samples_last_batch = get_batches(n_valid_samples, batch_size_valid)
+		# TODO: double-check if these batch sizes are consistent with dg.
+		#       maybe we can even put get_batches() in there as a method.
+		(n_train_batches,
+		 n_train_samples_last_batch) = get_batches(n_train_samples,
+		                                           batch_size//num_workers)
+		(n_valid_batches,
+		 n_valid_samples_last_batch) = get_batches(n_valid_samples,
+		                                           batch_size_valid//num_workers)
 
-		train_times = []
+		train_times  = []
 		train_epochs = []
-		save_epochs = []
+		save_epochs  = []
 
 		############### setup learning rate schedule ##############
 		step_counter = resume_from * n_train_batches
@@ -751,25 +779,25 @@ if __name__ == "__main__":
 		chief_print("N markers: {0}".format(n_markers))
 		chief_print("")
 
-		with strat.scope():
+		with strat.scope(): # TODO: what should be put into strat scope, again??...
 			autoencoder = Autoencoder(model_architecture, n_markers,
 			                          noise_std, regularizer)
 			optimizer = tf.optimizers.Adam(learning_rate = lr_schedule)
+
+			# get a single batch to:
+			# a) run through optimization to reload weights and optimizer variables,
+			# b) print layer dims
+			input_init, targets_init, _ = next(dg.dataset_train.as_numpy_iterator())
 
 			if resume_from:
 				chief_print("\n______________________________ Resuming training from epoch {0} ______________________________".format(resume_from))
 				weights_file_prefix = os.path.join(train_directory, "weights", str(resume_from))
 				chief_print("Reading weights from {0}".format(weights_file_prefix))
 
-				# get a single sample to run through optimization to reload weights and optimizer variables
-				input_init, targets_init, _= dg.get_train_batch(0.0, 1)
-				dg.reset_batch_index()
-				if not missing_mask_input:
-					input_init = input_init[:,:,0, np.newaxis]
-
 				# This initializes the variables used by the optimizers,
 				# as well as any stateful metric variables
-				run_optimization(autoencoder, optimizer, loss_func, input_init, targets_init)
+				run_optimization(autoencoder, optimizer, loss_func,
+				                 input_init[0,:], targets_init[0,:])
 				autoencoder.load_weights(weights_file_prefix)
 
 			chief_print("\n______________________________ Train ______________________________")
@@ -777,11 +805,7 @@ if __name__ == "__main__":
 			# a small run-through of the model with just 2 samples for printing the dimensions of the layers (verbose=True)
 			chief_print("Model layers and dimensions:")
 			chief_print("-----------------------------")
-
-			input_test, targets_test, _ = dg.get_train_set(0.0)
-			if not missing_mask_input:
-				input_test = input_test[:,:,0, np.newaxis]
-			output_test, encoded_data_test = autoencoder(input_test[0:2], is_training = False, verbose = True)
+			_, _ = autoencoder(input_init[:2,:], is_training=False, verbose=True)
 
 		######### Create objects for tensorboard summary ###############################
 
@@ -802,84 +826,65 @@ if __name__ == "__main__":
 		min_valid_loss_epoch = None
 
 		for e in range(1,epochs+1):
+			# TODO: profiler, mayhaps?
+			#       https://www.tensorflow.org/guide/profiler
 			startTime = datetime.now()
-			dg.shuffle_train_samples()
 			effective_epoch = e + resume_from
 			losses_t_batches = []
 			losses_v_batches = []
 
-			for ii in range(n_train_batches):
-				step_counter += 1
-
-				if sparsify_input:
-					sparsify_fraction = sparsifies[step_counter % len(sparsifies)]
-				else:
-					sparsify_fraction = 0.0
-
-				# last batch is probably not full
-				if ii == n_train_batches - 1:
-					batch_input, batch_target, _ = dg.get_train_batch(sparsify_fraction, n_train_samples_last_batch)
-				else:
-					batch_input, batch_target , _ = dg.get_train_batch(sparsify_fraction, batch_size)
-
-				# TODO temporary solution: should fix data generator so it doesnt bother with the mask if not needed
-				if not missing_mask_input:
-					batch_input = batch_input[:,:,0,np.newaxis]
-
-				train_batch_loss = run_optimization(autoencoder, optimizer, loss_func, batch_input, batch_target)
+			for batch_input, batch_target, _ in dg.dataset_train:
+				# TODO: replace with distributed train step! (all occurencies)
+				train_batch_loss = run_optimization(autoencoder,
+				                                    optimizer, loss_func,
+				                                    batch_input, batch_target)
 				losses_t_batches.append(train_batch_loss)
-
+				step_counter += 1
 			train_loss_this_epoch = np.average(losses_t_batches)
-
-			if isChief:
-				with train_writer.as_default():
-					tf.summary.scalar('loss', train_loss_this_epoch,
- 					                  step = step_counter)
-					if lr_schedule:
-						tf.summary.scalar("learning_rate",
-						       optimizer._decayed_lr(var_dtype=tf.float32),
-						       step = step_counter)
-					else:
-						tf.summary.scalar("learning_rate", learning_rate,
-						                  step = step_counter)
-
-			# TODO: should the loss arrays only be stored by the chief? Probably.
 
 			train_time = (datetime.now() - startTime).total_seconds()
 			train_times.append(train_time)
 			train_epochs.append(effective_epoch)
 			losses_t.append(train_loss_this_epoch)
 
+			if isChief:
+				with train_writer.as_default():
+					tf.summary.scalar("loss", train_loss_this_epoch,
+ 					                  step=step_counter)
+					if lr_schedule:
+						tf.summary.scalar("learning_rate",
+						       optimizer._decayed_lr(var_dtype=tf.float32),
+						       step=step_counter)
+					else:
+						tf.summary.scalar("learning_rate", learning_rate,
+						                  step=step_counter)
+
+			# TODO: should the loss arrays only be stored by the chief? Probably.
+
 			chief_print("")
 			chief_print("Epoch: {}/{}...".format(effective_epoch, epochs+resume_from))
 			chief_print("--- Train loss: {:.4f}  time: {}".format(train_loss_this_epoch, train_time))
-
 
 			if n_valid_samples > 0:
 
 				startTime = datetime.now()
 
-				for jj in range(n_valid_batches):
-					start = jj*batch_size_valid
-					if jj == n_valid_batches - 1:
-						input_valid_batch = input_valid[start:]
-						targets_valid_batch = targets_valid[start:]
-					else:
-						input_valid_batch = input_valid[start:start+batch_size_valid]
-						targets_valid_batch = targets_valid[start:start+batch_size_valid]
-
-					output_valid_batch, encoded_data_valid_batch = autoencoder(input_valid_batch, is_training = False)
-
-					valid_loss_batch = loss_func(y_pred = output_valid_batch, y_true = targets_valid_batch)
-					valid_loss_batch += sum(autoencoder.losses)
+				for batch_input_valid, batch_target_valid, _ in dg.dataset_valid:
+					# TODO: implement this; don't forget training=False
+					valid_loss_batch = get_distrib_losses(autoencoder,
+					                                      loss_func,
+					                                      batch_input_valid,
+					                                      batch_target_valid)
 					losses_v_batches.append(valid_loss_batch)
-
 				valid_loss_this_epoch = np.average(losses_v_batches)
-				with valid_writer.as_default():
-					tf.summary.scalar('loss', valid_loss_this_epoch, step=step_counter)
 
-				losses_v.append(valid_loss_this_epoch)
 				valid_time = (datetime.now() - startTime).total_seconds()
+				losses_v.append(valid_loss_this_epoch)
+
+				if isChief:
+					with valid_writer.as_default():
+						tf.summary.scalar("loss", valid_loss_this_epoch,
+						                  step=step_counter)
 
 				if valid_loss_this_epoch <= min_valid_loss:
 					min_valid_loss = valid_loss_this_epoch
@@ -889,7 +894,8 @@ if __name__ == "__main__":
 					if e > start_saving_from:
 						for f in glob.glob(os.path.join(train_directory, "weights", f"min_valid.{prev_min_val_loss_epoch}.*")):
 							os.remove(f)
-						save_ae_weights(effective_epoch, train_directory, autoencoder, prefix = "min_valid.")
+						save_ae_weights_distrib(effective_epoch, train_directory,
+						                        autoencoder, prefix = "min_valid.")
 
 				evals_since_min_valid_loss = effective_epoch - min_valid_loss_epoch
 				chief_print("--- Valid loss: {:.4f}  time: {} min loss: {:.4f} epochs since: {}".format(valid_loss_this_epoch, valid_time, min_valid_loss, evals_since_min_valid_loss))
@@ -898,40 +904,44 @@ if __name__ == "__main__":
 					break
 
 			if e % save_interval == 0 and e > start_saving_from :
-				save_ae_weights(effective_epoch, train_directory, autoencoder)
+				save_ae_weights_distrib(effective_epoch, train_directory, autoencoder)
 
+		# TODO: remember to fix STRAT SCOPE
+		save_ae_weights_distrib(effective_epoch, train_directory, autoencoder)
 
-
-
-		save_ae_weights(effective_epoch, train_directory, autoencoder)
-
-		outfilename = os.path.join(train_directory, "train_times.csv")
-		write_metric_per_epoch_to_csv(outfilename, train_times, train_epochs)
-
-		outfilename = os.path.join(train_directory, "losses_from_train_t.csv")
-		epochs_t_combined, losses_t_combined = write_metric_per_epoch_to_csv(outfilename, losses_t, train_epochs)
-		fig, ax = plt.subplots()
-		plt.plot(epochs_t_combined, losses_t_combined, label="train", c="orange")
-
-		if n_valid_samples > 0:
-			outfilename = os.path.join(train_directory, "losses_from_train_v.csv")
-			epochs_v_combined, losses_v_combined = write_metric_per_epoch_to_csv(outfilename, losses_v, train_epochs)
-			plt.plot(epochs_v_combined, losses_v_combined, label="valid", c="blue")
-			min_valid_loss_epoch = epochs_v_combined[np.argmin(losses_v_combined)]
-			plt.axvline(min_valid_loss_epoch, color="black")
-			plt.text(min_valid_loss_epoch + 0.1, 0.5,'min valid loss at epoch {}'.format(int(min_valid_loss_epoch)),
-					 rotation=90,
-					 transform=ax.get_xaxis_text1_transform(0)[0])
-
-		plt.xlabel("Epoch")
-		plt.ylabel("Loss function value")
-		plt.legend()
-		plt.savefig(os.path.join(train_directory, "losses_from_train.pdf"))
-		plt.close()
+		if isChief:
+			outfilename = os.path.join(train_directory, "train_times.csv")
+			write_metric_per_epoch_to_csv(outfilename, train_times, train_epochs)
+	
+			outfilename = os.path.join(train_directory, "losses_from_train_t.csv")
+			epochs_t_combined, losses_t_combined = write_metric_per_epoch_to_csv(outfilename, losses_t, train_epochs)
+			fig, ax = plt.subplots()
+			plt.plot(epochs_t_combined, losses_t_combined, label="train", c="orange")
+	
+			if n_valid_samples > 0:
+				outfilename = os.path.join(train_directory, "losses_from_train_v.csv")
+				epochs_v_combined, losses_v_combined = write_metric_per_epoch_to_csv(outfilename, losses_v, train_epochs)
+				plt.plot(epochs_v_combined, losses_v_combined, label="valid", c="blue")
+				min_valid_loss_epoch = epochs_v_combined[np.argmin(losses_v_combined)]
+				plt.axvline(min_valid_loss_epoch, color="black")
+				plt.text(min_valid_loss_epoch + 0.1, 0.5,'min valid loss at epoch {}'.format(int(min_valid_loss_epoch)),
+						 rotation=90,
+						 transform=ax.get_xaxis_text1_transform(0)[0])
+	
+			plt.xlabel("Epoch")
+			plt.ylabel("Loss function value")
+			plt.legend()
+			plt.savefig(os.path.join(train_directory, "losses_from_train.pdf"))
+			plt.close()
 
 		chief_print("Done training. Wrote to {0}".format(train_directory))
 
 	if arguments['project']:
+		if not isChief:
+			print("Work has ended for this worker")
+			exit(0)
+
+		# TODO: the 'train' suffix in this section is confusing.
 
 		projected_epochs = get_projected_epochs(encoded_data_file)
 
@@ -951,14 +961,16 @@ if __name__ == "__main__":
 		chief_print("Projecting epochs: {0}".format(epochs))
 		chief_print("Already projected: {0}".format(projected_epochs))
 
-		batch_size_project = 50
+		batch_size_project = 50  # TODO: this should be adjustable.
 		sparsify_fraction = 0.0
 
-		_, _, ind_pop_list_train_reference = dg.get_train_set(sparsify_fraction)
-
-		write_h5(encoded_data_file, "ind_pop_list_train", np.array(ind_pop_list_train_reference, dtype='S'))
-
-		n_unique_train_samples = copy.deepcopy(dg.n_train_samples)
+		ds_args = {"batch_size" :     batch_size_project,
+		           "outprefix"  :     tfr_prefix,
+		           "valid_split":     0.0,
+		           "sparsifies" :     [sparsify_fraction],
+		           "num_workers":     num_workers,
+		           "shuffle_dataset": False} # TODO: auto chunk size!
+		dg.create_tf_dataset(**ds_args)
 
 		# loss function of the train set per epoch
 		losses_train = []
@@ -981,80 +993,65 @@ if __name__ == "__main__":
 			weights_file_prefix = os.path.join(train_directory, "weights", str(epoch))
 			chief_print("Reading weights from {0}".format(weights_file_prefix))
 
-			input, targets, _= dg.get_train_batch(sparsify_fraction, 1)
-			if not missing_mask_input:
-				input = input[:,:,0, np.newaxis]
-
-			# This initializes the variables used by the optimizers,
-			# as well as any stateful metric variables
-			# run_optimization(autoencoder, optimizer, loss_func, input, targets)
+			# TODO: find out if we should run 1-2 samples through optimization
+			#       in order to load the weights here.
 			autoencoder.load_weights(weights_file_prefix)
 
-			if batch_size_project:
-				dg.reset_batch_index()
+			ind_pop_list_train = np.empty(shape=(0,2), dtype=str)
+			encoded_train = np.empty((0, n_latent_dim))
+			decoded_train = None
+			targets_train = np.empty((0, n_markers))
+			mask = np.empty((0, n_markers))
+			# TODO: ^ this assumes that missing_mask_input is always True when projecting!
+			#       and also makes it impossible to use sparsify when projecting, which should be pointed out.
 
-				n_train_batches = (n_unique_train_samples // batch_size_project) + 1
-				n_train_samples_last_batch = n_unique_train_samples % batch_size_project
+			loss_value_per_batch = []
+			genotype_conc_per_batch = []
 
+			for batch_input, batch_target, batch_indpop in dg.dataset_train:
 
-				ind_pop_list_train = np.empty((0,2))
-				encoded_train = np.empty((0, n_latent_dim))
-				decoded_train = None
-				targets_train = np.empty((0, n_markers))
+				# TODO: check how the mask dimension is handled here!
+				#       and wherever else dg batches are used
+				decoded_batch, encoded_batch = autoencoder(batch_input,
+				                                           is_training=False)
+				loss_batch  = loss_func(y_pred=decoded_batch, y_true=batch_target)
+				loss_batch += sum(autoencoder.losses)
 
-				loss_value_per_train_batch = []
-				genotype_conc_per_train_batch = []
+				ind_pop_list_train=np.concatenate((ind_pop_list_train, batch_indpop), axis=0)
+				encoded_train=np.concatenate((encoded_train, encoded_batch), axis=0)
+				if decoded_train is None:
+					decoded_train=np.copy(decoded_batch[:,0:n_markers])
+				else:
+					decoded_train=np.concatenate((decoded_train, decoded_batch[:,0:n_markers]), axis=0)
+				targets_train=np.concatenate((targets_train, batch_target[:,0:n_markers]), axis=0)
 
-				for b in range(n_train_batches):
+				mask = np.concatenate((mask, batch_input[:,:,1]), axis=0)
 
-					if b == n_train_batches - 1:
-						input_train_batch, targets_train_batch, ind_pop_list_train_batch = dg.get_train_batch(sparsify_fraction, n_train_samples_last_batch)
-					else:
-						input_train_batch, targets_train_batch, ind_pop_list_train_batch = dg.get_train_batch(sparsify_fraction, batch_size_project)
+				loss_value_per_batch.append(loss_batch)
 
-					if not missing_mask_input:
-						input_train_batch = input_train_batch[:,:,0, np.newaxis]
+			ind_pop_list_train = np.array(ind_pop_list_train)
+			encoded_train = np.array(encoded_train)
+			mask = tf.cast(mask, tf.bool)
+			loss_value = np.average(loss_value_per_batch)
 
-					decoded_train_batch, encoded_train_batch = autoencoder(input_train_batch, is_training = False)
-					loss_train_batch = loss_func(y_pred = decoded_train_batch, y_true = targets_train_batch)
-					loss_train_batch += sum(autoencoder.losses)
+			if epoch == epochs[0]:
+				assert len(ind_pop_list_train) == dg.n_total_samples, \
+				       f"{len(ind_pop_list_train)} vs {dg.n_total_samples}"
+				assert len(encoded_train) == dg.n_total_samples, \
+				       f"{len(encoded_train)} vs {dg.n_total_samples}"
 
-					ind_pop_list_train = np.concatenate((ind_pop_list_train, ind_pop_list_train_batch), axis=0)
-					encoded_train = np.concatenate((encoded_train, encoded_train_batch), axis=0)
-					if decoded_train is None:
-						decoded_train = np.copy(decoded_train_batch[:,0:n_markers])
-					else:
-						decoded_train = np.concatenate((decoded_train, decoded_train_batch[:,0:n_markers]), axis=0)
-					targets_train = np.concatenate((targets_train, targets_train_batch[:,0:n_markers]), axis=0)
-
-					loss_value_per_train_batch.append(loss_train_batch)
-
-				ind_pop_list_train = np.array(ind_pop_list_train)
-				encoded_train = np.array(encoded_train)
-				loss_value = np.average(loss_value_per_train_batch)
-
-				if epoch == epochs[0]:
-					assert len(ind_pop_list_train) == dg.n_train_samples, "{0} vs {1}".format(len(ind_pop_list_train), dg.n_train_samples)
-					assert len(encoded_train) == dg.n_train_samples, "{0} vs {1}".format(len(encoded_train), dg.n_train_samples)
-					assert list(ind_pop_list_train[:,0]) == list(ind_pop_list_train_reference[:,0])
-					assert list(ind_pop_list_train[:,1]) == list(ind_pop_list_train_reference[:,1])
-			else:
-				input_train, targets_train, ind_pop_list_train = dg.get_train_set(sparsify_fraction)
-
-				if not missing_mask_input:
-					input_train = input_train[:,:,0, np.newaxis]
-
-				decoded_train, encoded_train = autoencoder(input_train, is_training = False)
-				loss_value = loss_func(y_pred = decoded_train, y_true = targets_train)
-				loss_value += sum(autoencoder.losses)
+				write_h5(encoded_data_file, "ind_pop_list_train",
+				         np.array(ind_pop_list_train, dtype='S'))
 
 			genotype_concordance_metric.reset_states()
 
-			if not fill_missing:
-				orig_nonmissing_mask = get_originally_nonmissing_mask(targets_train)
-			else:
-				orig_nonmissing_mask = np.full(targets_train.shape, True)
+			# TODO: see get_originally_nonmissing_mask(), I wanna get rid of it.
+			#if not fill_missing:
+			#	orig_nonmissing_mask = get_originally_nonmissing_mask(targets_train)
+			#else:
+			#	orig_nonmissing_mask = np.full(targets_train.shape, True)
 
+			# TODO: maybe copy train_opts to project_opts in this mode or something. just for clarity.
 			if train_opts["loss"]["class"] == "MeanSquaredError" and (data_opts["norm_mode"] == "smartPCAstyle" or data_opts["norm_mode"] == "standard"):
 				try:
 					scaler = dg.scaler
@@ -1065,19 +1062,27 @@ if __name__ == "__main__":
 
 				genotypes_output = to_genotypes_invscale_round(decoded_train[:, 0:n_markers], scaler_vals = scaler)
 				true_genotypes = to_genotypes_invscale_round(targets_train, scaler_vals = scaler)
-				genotype_concordance_metric.update_state(y_pred = genotypes_output[orig_nonmissing_mask],
-														 y_true = true_genotypes[orig_nonmissing_mask])
+				#genotype_concordance_metric.update_state(y_pred = genotypes_output[orig_nonmissing_mask],
+				#                                         y_true = true_genotypes[orig_nonmissing_mask])
+				genotype_concordance_metric.update_state(y_pred = genotypes_output[mask],
+				                                         y_true = true_genotypes[mask])
 
 
 			elif train_opts["loss"]["class"] == "BinaryCrossentropy" and data_opts["norm_mode"] == "genotypewise01":
 				genotypes_output = to_genotypes_sigmoid_round(decoded_train[:, 0:n_markers])
 				true_genotypes = targets_train
-				genotype_concordance_metric.update_state(y_pred = genotypes_output[orig_nonmissing_mask], y_true = true_genotypes[orig_nonmissing_mask])
+				#genotype_concordance_metric.update_state(y_pred = genotypes_output[orig_nonmissing_mask],
+				#                                         y_true = true_genotypes[orig_nonmissing_mask])
+				genotype_concordance_metric.update_state(y_pred = genotypes_output[mask],
+				                                         y_true = true_genotypes[mask])
 
 			elif train_opts["loss"]["class"] in ["CategoricalCrossentropy", "KLDivergence"] and data_opts["norm_mode"] == "genotypewise01":
 				genotypes_output = tf.cast(tf.argmax(alfreqvector(decoded_train[:, 0:n_markers]), axis = -1), tf.float16) * 0.5
 				true_genotypes = targets_train
-				genotype_concordance_metric.update_state(y_pred = genotypes_output[orig_nonmissing_mask], y_true = true_genotypes[orig_nonmissing_mask])
+				#genotype_concordance_metric.update_state(y_pred = genotypes_output[orig_nonmissing_mask],
+				#                                         y_true = true_genotypes[orig_nonmissing_mask])
+				genotype_concordance_metric.update_state(y_pred = genotypes_output[mask],
+				                                         y_true = true_genotypes[mask])
 
 			else:
 				chief_print("Could not calculate predicted genotypes and genotype concordance. Not implemented for loss {0} and normalization {1}.".format(train_opts["loss"]["class"], data_opts["norm_mode"]))
@@ -1090,6 +1095,8 @@ if __name__ == "__main__":
 			genotype_concs_train.append(genotype_concordance_value)
 
 			if superpopulations_file:
+				# TODO: might have to reimplement all these functions from the old data handler,
+				#       to make them work with the new one.
 				coords_by_pop = get_coords_by_pop(data_prefix, encoded_train, ind_pop_list = ind_pop_list_train)
 
 				if doing_clustering:
@@ -1121,7 +1128,6 @@ if __name__ == "__main__":
 					plot_coords(encoded_train,
 					            os.path.join(results_directory,
 					                         f"dimred_e_{epoch}"))
-
 
 			write_h5(encoded_data_file, f"{epoch}_encoded_train", encoded_train)
 
@@ -1170,6 +1176,9 @@ if __name__ == "__main__":
 		plt.close()
 
 	if arguments['animate']:
+		if not isChief:
+			print("Work has ended for this worker")
+			exit(0)
 
 		chief_print("Animating epochs {}".format(epochs))
 
@@ -1212,6 +1221,9 @@ if __name__ == "__main__":
 		                            f"dimred_animation{suffix}"))
 
 	if arguments['evaluate']:
+		if not isChief:
+			print("Work has ended for this worker")
+			exit(0)
 
 		chief_print("Evaluating epochs {}".format(epochs))
 
@@ -1328,6 +1340,9 @@ if __name__ == "__main__":
 				res_writer.writerow(metrics[m])
 
 	if arguments['plot']:
+		if not isChief:
+			print("Work has ended for this worker")
+			exit(0)
 
 		chief_print("Plotting epochs {}".format(epochs))
 
