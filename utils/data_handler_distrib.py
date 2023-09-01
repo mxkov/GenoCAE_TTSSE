@@ -7,43 +7,16 @@ import scipy
 import tensorflow as tf
 import utils.normalization as normalization
 
-
-def _bytes_feature(value):
-	if isinstance(value, type(tf.constant(0))):
-		value = value.numpy()
-	return tf.train.Feature(bytes_list=tf.train.BytesList(value=[value]))
-
-def _int64_feature(value):
-	return tf.train.Feature(int64_list=tf.train.Int64List(value=[value]))
-
-def make_example(genos_, indpop_):
-	features_ = {
-		'len':    _int64_feature(genos_.shape[0]),
-		'snp':    _bytes_feature(tf.io.serialize_tensor(genos_)),
-		'indpop': _bytes_feature(tf.io.serialize_tensor(indpop_))
-	}
-	return tf.train.Example(features=tf.train.Features(feature=features_))
-
-def decode_example(x, geno_dtype=np.float32):
-	features_ = {
-		'len':    tf.io.FixedLenFeature([], tf.int64),
-		'snp':    tf.io.FixedLenFeature([], tf.string),
-		'indpop': tf.io.FixedLenFeature([], tf.string)
-	}
-	example = tf.io.parse_single_example(x, features_)
-	genos_  = tf.io.parse_tensor(example['snp'],
-	                             out_type=tf.as_dtype(geno_dtype))
-	indpop_ = tf.io.parse_tensor(example['indpop'],
-	                             out_type=tf.string)
-	return genos_, indpop_
-# TODO: ^ move all these down, and encapsulate
+# TODO: backwards compatibility with PLINK / EIGENSTRAT
+# TODO: also, doesn't make sense to convert to tfrecords if you only want to project.
+#       feed a `training` arg to create_tf_dataset and add an option to skip that.
 
 
 class data_generator_distrib:
 	"""docstring""" # TODO: DOCS & comments
 
 	def __init__(self, filebase,
-	             missing_mask=True, impute_missing=True,
+	             missing_mask=True, impute_missing=False,
 	             normalization_mode="genotypewise01",
 	             normalization_options={"flip": False,
 	                                    "missing_val": -1.0}):
@@ -86,29 +59,10 @@ class data_generator_distrib:
 		self.ind_pop_list_valid = np.empty(shape=(0,2), dtype=str)
 
 
-	def _define_validation_set(self, random_state=None):
-		# TODO: should be stratified by population in the general case
-		self.n_valid_samples = np.floor(self.n_total_samples*self.valid_split)
-		self.n_train_samples = self.n_total_samples - self.n_valid_samples
-
-		np.random.seed(random_state)
-		self.sample_idx_valid = np.random.choice(self.sample_idx_all,
-		                                         size=self.n_valid_samples,
-		                                         replace=False)
-		self.sample_idx_valid = np.sort(self.sample_idx_valid)
-		train_idx = np.in1d(self.sample_idx_train, self.sample_idx_valid,
-		                    invert=True)
-		self.sample_idx_train = np.copy(self.sample_idx_train[train_idx])
-
-		self.ind_pop_list_train=np.copy(self.ind_pop_list[self.sample_idx_train,:])
-		self.ind_pop_list_valid=np.copy(self.ind_pop_list[self.sample_idx_valid,:])
-		# TODO: see where else to insert np.copy
-
-
 	# The most important method to be called from outer scope
 	def create_tf_dataset(self, batch_size, outprefix,
 	                      valid_split=0.2, valid_random_state=None,
-	                      geno_dtype=np.float32, sparsifies=None,
+	                      geno_dtype=np.float32, sparsifies=[],
 	                      num_workers=1,
 	                      batch_shards=False, pref_chunk_size=None,
 	                      shuffle_tfrecords=False, shuffle_dataset=True,
@@ -141,7 +95,7 @@ class data_generator_distrib:
 		if shuffle_dataset:
 			ds = ds.shuffle(buffer_size=self.n_total_samples)
 
-		self._define_validation_set(random_state=valid_random_state)
+		self.define_validation_set(random_state=valid_random_state)
 		ds_train, ds_valid = self.finalize_train_valid_sets(ds)
 		self.dataset_train = ds_train
 		self.dataset_valid = ds_valid
@@ -163,8 +117,8 @@ class data_generator_distrib:
 		                                    output_signature=gen_outshapes,
 		                                    args=gen_args)
 
-		# TODO: if training, prep norm scaler
-		# (if norm methods other than genotype-wise are applicable)
+		# This spot is where we would prepare normalization scaler,
+		# if normalization methods other than genotype-wise were applicable.
 
 		ds = ds.map(self._normalize, num_parallel_calls=tf.data.AUTOTUNE)
 
@@ -180,7 +134,7 @@ class data_generator_distrib:
 		# https://stackoverflow.com/q/68164440
 
 		n_samples = self.n_total_samples
-		cur_sample_idx = tf.cast(self.sample_idx_all, tf.int32)
+		cur_sample_idx = tf.cast(np.copy(self.sample_idx_all), tf.int32)
 		if shuffle_:
 			cur_sample_idx = tf.random.shuffle(cur_sample_idx)
 
@@ -197,8 +151,7 @@ class data_generator_distrib:
 		                         thrift_container_size_limit = int32_t_MAX,
 		                         use_legacy_dataset = False)
 		# OBS! might not preserve column order. rely on schema instead.
-		pqds_schema = pqds.schema
-		inds_sch = [entry.name for entry in pqds_schema]
+		inds_sch = [entry.name for entry in pqds.schema]
 		inds_fam = list(self.ind_pop_list[:,0])
 		if inds_sch != inds_fam:
 			raise ValueError("Parquet schema inconsistent with FAM files")
@@ -211,120 +164,80 @@ class data_generator_distrib:
 
 			start = chunk_size * chunks_read
 			end   = chunk_size *(chunks_read+1)
-			chunk_idx = cur_sample_idx[start:end,:]
+			chunk_idx = cur_sample_idx[start:end]
 			# Last chunk does not necessarily contain chunk_size samples!
 
-			inds_to_read = list(self.ind_pop_list[chunk_idx,0])
+			chunk_indpop = self.ind_pop_list[chunk_idx,:]
+			inds_to_read = list(chunk_indpop[:,0])
 			chunk = pqds.read(columns = inds_to_read,
 			                  use_threads = True,  # TODO: try without
 			                  use_pandas_metadata = False)
-			sch   = chunk.schema
+			assert [entry.name for entry in chunk.schema] == inds_to_read
 			chunk = chunk.to_pandas(self_destruct=True).to_numpy(dtype=self.geno_dtype)
 			# TODO: if you use float16, other scripts should support that
 			chunk = chunk.T
-			assert chunk.shape[1] == self.n_markers
-			assert [entry.name for entry in sch] == inds_to_read
-
+			if chunk.shape[1] != self.n_markers:
+				raise ValueError("Parquet table size inconsistent with BIM "+
+				                f"files: {self.n_markers} markers expected "+
+				                f"but {chunk.shape[1]} markers read")
 			chunks_read += 1
 
 			batches_read = 0
-			batches_in_chunk = np.ceil(chunk.shape[0]/gen_batch_size)
 			last_batch_in_chunk = False
-			while batches_read < batches_in_chunk:
+			while not last_batch_in_chunk:
 
 				start_ = gen_batch_size * batches_read
 				end_   = gen_batch_size *(batches_read+1)
-				batch = chunk[start_:end_]
+
+				batch_genos  = chunk[start_:end_,:]
+				batch_indpop = chunk_indpop[start_:end_,:]
 				if end_ >= chunk.shape[0]:
 					last_batch_in_chunk = True
 
-				batch_idx    = cur_sample_idx[start_:end_]
-				batch_indpop = self.ind_pop_list[batch_idx,:]
-
 				batches_read += 1
 
-				yield batch, batch_indpop, last_batch_in_chunk
+				yield batch_genos, batch_indpop, last_batch_in_chunk
 
 
-	def _normalize(self, x, indpop, last_batch):
+	def _normalize(self, genos, indpop, last_batch):
 		"""normalize and insert missing value"""
 
-		missing = tf.where(x == 9)
-		a = tf.ones(shape=tf.shape(missing)[0], dtype=x.dtype)
-		a = tf.sparse.SparseTensor(indices=missing, values=a,
-		                           dense_shape=x.shape)
+		where_missing = tf.where(genos==9)
+		a = tf.ones(shape=tf.shape(where_missing)[0], dtype=genos.dtype)
+		a = tf.sparse.SparseTensor(indices=where_missing, values=a,
+		                           dense_shape=genos.shape)
 
 		if self.impute_missing:
-			most_common_genos = self._get_most_common_genotypes(x)
-			# TODO: this is batch level.
-			b = tf.gather(most_common_genos, indices=missing[:,1])-9
-			b = tf.sparse.SparseTensor(indices=missing, values=b,
-			                           dense_shape=x.shape)
-			x = tf.sparse.add(x, b)
+			most_common_genos = get_most_common_genotypes(genos)
+			b = tf.gather(most_common_genos, indices=where_missing[:,1])-9
+			b = tf.sparse.SparseTensor(indices=where_missing, values=b,
+			                           dense_shape=genos.shape)
+			genos = tf.sparse.add(genos, b)
 
 		if self.normalization_mode == "genotypewise01":
 			if self.normalization_options["flip"]:
-				x = -(x-2)/2
+				genos = -(genos-2)/2
+				# Missing genotypes will turn from 9 into -3.5,
+				# need to replace those with missing_val.
 				if not self.impute_missing:
-					x = tf.sparse.add(x, a*(3.5-self.missing_val))
-					# TODO: do we flip the missing value here too?
+					genos = tf.sparse.add(genos, a*(3.5+self.missing_val))
+					# Thus, missing_val is NOT being flipped,
+					# which should be taken into account when setting it.
 			else:
-				x = x/2
+				genos = genos/2
+				# Missing genotypes will turn from 9 into 4.5,
+				# need to replace those with missing_val.
 				if not self.impute_missing:
-					x = tf.sparse.add(x, a*(self.missing_val-4.5))
+					genos = tf.sparse.add(genos, a*(self.missing_val-4.5))
 
 		elif self.normalization_mode in ("standard", "smartPCAstyle"):
 			raise NotImplementedError("Only genotypewise01 normalization "+
 			                          "method supported for now")
-
-		return x, indpop, last_batch
-
-
-	def _get_most_common_genotypes(self, x_):
-		return scipy.stats.mode(x_).mode[0]
-
-
-	def _mask_and_sparsify(self, x, indpop):
-
-		sparsify = False
-		if self.sparsifies is not None and len(self.sparsifies)>0:
-			sparsify_fraction = np.random.choice(self.sparsifies)
-			if sparsify_fraction > 0.0:
-				sparsify = True
-
-		if not sparsify and not self.missing_mask:
-			inputs = tf.expand_dims(x, axis=-1)
-			return inputs, x, indpop
-
-		inputs = tf.identity(x)
-		mask   = tf.experimental.numpy.full(shape=x.shape, fill_value=1,
-		                                    dtype=x.dtype)
-
-		if sparsify:
-			probs = tf.random.uniform(shape=x.shape, minval=0, maxval=1)
-			where_sparse = tf.where(probs < sparsify_fraction)
-			delta_s = tf.repeat(-1, tf.shape(where_sparse)[0])
-			delta_s = tf.sparse.SparseTensor(indices=where_sparse,
-			                                 values=delta_s,
-			                                 dense_shape=mask.shape)
-			mask = tf.sparse.add(mask, delta_s)
-			inputs = tf.math.add(tf.math.multiply(inputs, mask),
-			                     self.missing_val*(1-mask))
-
-		if self.missing_mask:
-			if not self.impute_missing:
-				where_missing = tf.where(x == self.missing_val)
-				delta_m = tf.repeat(0, tf.shape(where_missing)[0])
-				delta_m = tf.sparse.SparseTensor(indices=where_missing,
-				                                 values=delta_m,
-				                                 dense_shape=mask.shape)
-				mask = tf.sparse.sparse_dense_matmul(delta_m, mask)
-			inputs = tf.stack([inputs, mask], axis=-1)
 		else:
-			inputs = tf.expand_dims(inputs, axis=-1)
+			raise ValueError("Unknown normalization mode: "+
+			                f"{self.normalization_mode}")
 
-		return inputs, x, indpop
-		# TODO: mind that x are targets. mb make this clearer in the code.
+		return genos, indpop, last_batch
 
 
 	def write_TFRecords(self, dataset):
@@ -338,17 +251,19 @@ class data_generator_distrib:
 		#
 		# For now, going with precisely one chunk per shard.
 		# Will have to see how this works out.
+		# Ideally, should have an option to further split a chunk into shards.
+		# For now, will just read smaller chunks if more shards are needed.
 
 		batch_count = 0
 		shard_count = 0
 		total_shards = self.total_chunks
 		zfill_len = len(str(total_shards-1))
-		for batch, batch_indpop, last_batch_in_chunk in dataset:
+		for batch_genos, batch_indpop, last_batch_in_chunk in dataset:
 			if batch_count == 0:
-				genos  = batch
+				genos  = batch_genos
 				indpop = batch_indpop
 			else:
-				genos  = tf.concat([genos,  batch], axis=0)
+				genos  = tf.concat([genos,  batch_genos ], axis=0)
 				indpop = tf.concat([indpop, batch_indpop], axis=0)
 			batch_count += 1
 
@@ -370,17 +285,37 @@ class data_generator_distrib:
 			writer.close()
 
 
+	def define_validation_set(self, random_state=None):
+		# TODO: should be stratified by population in the general case
+		self.n_valid_samples = np.floor(self.n_total_samples*self.valid_split)
+		self.n_train_samples = self.n_total_samples - self.n_valid_samples
+
+		np.random.seed(random_state)
+		self.sample_idx_valid = np.random.choice(self.sample_idx_all,
+		                                         size=self.n_valid_samples,
+		                                         replace=False)
+		self.sample_idx_valid = np.sort(self.sample_idx_valid)
+		train_idx = np.in1d(self.sample_idx_all, self.sample_idx_valid,
+		                    invert=True)
+		self.sample_idx_train = np.copy(self.sample_idx_all[train_idx])
+		self.sample_idx_train = np.sort(self.sample_idx_train)
+
+		self.ind_pop_list_train=np.copy(self.ind_pop_list[self.sample_idx_train,:])
+		self.ind_pop_list_valid=np.copy(self.ind_pop_list[self.sample_idx_valid,:])
+
+
 	def finalize_train_valid_sets(self, dataset):
 
 		def filter_by_indpop(ds_, ind_pop_list_):
-			return ds_.filter(lambda x,y: y.numpy().astype("str") \
-			                              in ind_pop_list_)
+			return ds_.filter(lambda genos,indpop: indpop.numpy().astype("str")\
+			                                       in ind_pop_list_)
 
 		def check_size(ds_, ref_size, label):
-			size = sum([1 for x,y in ds_.as_numpy_iterator()])
+			size = sum([1 for genos,indpop in ds_.as_numpy_iterator()])
 			if size != ref_size:
 				raise ValueError(f"Wrong {label} dataset size: "+
-				                 f"got {size}, expected {ref_size}")
+				                 f"got {size} samples, "+
+				                 f"expected {ref_size} samples")
 
 		def finalize_split(ds_):
 			ds_ = ds_.prefetch(tf.data.AUTOTUNE)
@@ -389,12 +324,12 @@ class data_generator_distrib:
 			              num_parallel_calls=tf.data.AUTOTUNE)
 			return ds_
 
-		if self.n_valid_samples == 0:
-			ds_train_ = dataset
-			ds_valid_ = None
-		else:
+		if self.n_valid_samples > 0:
 			ds_train_ = filter_by_indpop(dataset, self.ind_pop_list_train)
 			ds_valid_ = filter_by_indpop(dataset, self.ind_pop_list_valid)
+		else:
+			ds_train_ = dataset
+			ds_valid_ = None
 
 		check_size(ds_train_, self.n_train_samples, "training")
 		ds_train_ = finalize_split(ds_train_)
@@ -403,3 +338,82 @@ class data_generator_distrib:
 			ds_valid_ = finalize_split(ds_valid_)
 
 		return ds_train_, ds_valid_
+
+
+	def _mask_and_sparsify(self, genos, indpop):
+
+		sparsify = False
+		if len(self.sparsifies) > 0:
+			sparsify_fraction = np.random.choice(self.sparsifies)
+			if sparsify_fraction > 0.0:
+				sparsify = True
+
+		if not sparsify and not self.missing_mask:
+			inputs = tf.expand_dims(genos, axis=-1)
+			return inputs, genos, indpop
+
+		inputs = tf.identity(genos)
+		mask   = tf.experimental.numpy.full(shape=genos.shape, fill_value=1,
+		                                    dtype=genos.dtype)
+
+		if sparsify:
+			probs = tf.random.uniform(shape=genos.shape, minval=0, maxval=1)
+			where_sparse = tf.where(probs < sparsify_fraction)
+			delta_s = tf.repeat(-1, tf.shape(where_sparse)[0])
+			delta_s = tf.sparse.SparseTensor(indices=where_sparse,
+			                                 values=delta_s,
+			                                 dense_shape=mask.shape)
+			mask = tf.sparse.add(mask, delta_s)
+			inputs = tf.math.add(tf.math.multiply(inputs, mask),
+			                     self.missing_val*(1-mask))
+
+		if self.missing_mask:
+			if not self.impute_missing:
+				where_missing = tf.where(genos == self.missing_val)
+				delta_m = tf.repeat(0, tf.shape(where_missing)[0])
+				delta_m = tf.sparse.SparseTensor(indices=where_missing,
+				                                 values=delta_m,
+				                                 dense_shape=mask.shape)
+				mask = tf.sparse.sparse_dense_matmul(delta_m, mask)
+			inputs = tf.stack([inputs, mask], axis=-1)
+		else:
+			inputs = tf.expand_dims(inputs, axis=-1)
+
+		# genos will serve as targets
+		return inputs, genos, indpop
+
+
+def get_most_common_genotypes(genos_):
+	return scipy.stats.mode(genos_).mode[0]
+
+
+def make_example(genos_, indpop_):
+
+	def int64_feature(value):
+		return tf.train.Feature(int64_list=tf.train.Int64List(value=[value]))
+
+	def bytes_feature(value):
+		if isinstance(value, type(tf.constant(0))):
+			value = value.numpy()
+		return tf.train.Feature(bytes_list=tf.train.BytesList(value=[value]))
+
+	features_ = {
+		'len':    int64_feature(genos_.shape[0]),
+		'snp':    bytes_feature(tf.io.serialize_tensor(genos_)),
+		'indpop': bytes_feature(tf.io.serialize_tensor(indpop_))
+	}
+	return tf.train.Example(features=tf.train.Features(feature=features_))
+
+
+def decode_example(x, geno_dtype=np.float32):
+	features_ = {
+		'len':    tf.io.FixedLenFeature([], tf.int64),
+		'snp':    tf.io.FixedLenFeature([], tf.string),
+		'indpop': tf.io.FixedLenFeature([], tf.string)
+	}
+	example = tf.io.parse_single_example(x, features_)
+	genos_  = tf.io.parse_tensor(example['snp'],
+	                             out_type=tf.as_dtype(geno_dtype))
+	indpop_ = tf.io.parse_tensor(example['indpop'],
+	                             out_type=tf.string)
+	return genos_, indpop_
