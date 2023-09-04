@@ -28,6 +28,12 @@ Options:
 
 """
 
+# TODO next:
+# https://www.tensorflow.org/guide/distributed_training
+# https://www.tensorflow.org/tutorials/distribute/multi_worker_with_ctl
+# https://www.tensorflow.org/tutorials/distribute/save_and_load
+# https://www.tensorflow.org/tutorials/distribute/input
+
 from docopt import docopt, DocoptExit
 import tensorflow as tf
 import tensorflow.distribute as tfd
@@ -51,6 +57,9 @@ import copy
 import h5py
 import matplotlib.animation as animation
 from pathlib import Path
+# TODO: set_tf_config. try running a dummy job on Bianca and reading its env vars to figure out the format.
+#       and yes, this func has to be in its own file, for modularity. diff HPCs might require diff custom implementations.
+#       but try making it cluster-agnostic if possible.
 
 
 def _isChief():
@@ -333,13 +342,28 @@ def run_optimization(model, optimizer, loss_function, input, targets):
 	'''
 	with tf.GradientTape() as g:
 		output, encoded_data = model(input, is_training=True)
-		loss_value = loss_function(y_pred = output, y_true = targets)
-		loss_value += sum(model.losses)
+		loss_value  = loss_function(y_pred = output, y_true = targets)
+		loss_value += tf.nn.scale_regularization_loss(sum(model.losses))
+		# TODO: ^ read more abt this function
 
 	gradients = g.gradient(loss_value, model.trainable_variables)
 
-	optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+	optimizer.apply_gradients(zip(gradients, model.trainable_variables),
+	                          skip_gradients_aggregation=True)
+	# TODO: "If true, gradients aggregation will not be performed inside optimizer.
+	#        Usually this arg is set to True when you write custom code
+	#        aggregating gradients outside the optimizer. "
 	return loss_value
+
+@tf.function
+def train_step_distrib(model_, optimizer_, loss_function_, input_, targets_):
+
+	per_replica_losses = strat.run(run_optimization,
+	                               args=(model_, optimizer_, loss_function_,
+	                                     input_, targets_))
+	loss = strat.reduce("SUM", per_replica_losses, axis=None)
+
+	return loss 
 
 
 def get_distrib_losses(autoencoder, loss_func, inputs, targets):
@@ -424,10 +448,10 @@ if __name__ == "__main__":
 		# TODO: mind that set_tf_config() is implemented in utils.set_tf_config_berzelius_1_proc_per_gpu
 		addresses, chief, num_workers = set_tf_config()
 		isChief = os.environ["SLURMD_NODENAME"] == chief
-		os.environ["isChief"] = json.dumps(str(isChief))
+		os.environ["isChief"] = json.dumps(str(isChief)) # TODO
 		chief_print("Number of workers: {}".format(num_workers))
 
-		if num_workers > 1 and not arguments["evaluate"]:
+		if num_workers > 1 and arguments["train"]:
 			# Don't use SlurmClusterResolver: we don't always run this on an HPC cluster
 			resolver = tfd.cluster_resolver.TFConfigClusterResolver()
 			comm_opts = tfde.CommunicationOptions(implementation = tfde.CommunicationImplementation.NCCL)
@@ -445,6 +469,7 @@ if __name__ == "__main__":
 
 	else:
 		isChief = True
+		os.environ["isChief"] = json.dumps(str(isChief)) # TODO
 		slurm_job = 0
 		num_workers = 1
 		strat = tfd.MirroredStrategy()
@@ -517,7 +542,9 @@ if __name__ == "__main__":
 	chief_print("______________________________")
 
 
-	batch_size = train_opts["batch_size"] * num_devices
+	batch_size = train_opts["batch_size"]
+	global_batch_size = train_opts["batch_size"] * num_devices
+	# TODO: careful with this ^ when you e.g. project, bc you retire all non-chief workers then
 	learning_rate = train_opts["learning_rate"] * num_devices
 	# TODO: ^ check this later
 	regularizer = train_opts["regularizer"]
@@ -542,6 +569,7 @@ if __name__ == "__main__":
 		sparsify_input = False
 		missing_mask_input = False
 		n_input_channels = 1
+		sparsifies = []
 
 	if "impute_missing" in data_opts.keys():
 		fill_missing = data_opts["impute_missing"]
@@ -570,7 +598,7 @@ if __name__ == "__main__":
 	data_prefix = os.path.join(datadir, pdata)
 	results_directory = os.path.join(train_directory, pdata)
 	try:
-		os.mkdir(results_directory)
+		os.makedirs(results_directory)
 	except OSError:
 		pass
 
@@ -618,7 +646,7 @@ if __name__ == "__main__":
 				exit(1)
 
 	else:
-		dg = data_generator_distrib(data_prefix,
+		dg = data_generator_distrib(filebase = data_prefix,
 		                            missing_mask = missing_mask_input,
 		                            impute_missing = fill_missing,
 		                            normalization_mode = norm_mode,
@@ -627,7 +655,10 @@ if __name__ == "__main__":
 
 		tfr_dir = os.path.join(Path(data_prefix).resolve().parent, "TFRecords")
 		if not os.path.isdir(tfr_dir):
-			os.makedirs(tfr_dir)
+			try:
+				os.makedirs(tfr_dir)
+			except OSError:
+				pass
 		tfr_prefix = os.path.join(tfr_dir, Path(data_prefix).resolve().name)
 
 		loss_def = train_opts["loss"]
@@ -656,6 +687,8 @@ if __name__ == "__main__":
 
 			return orig_nonmissing_mask
 
+		# TODO: marry the losses with strat scope.
+		#       + sort out the thing with get-orig-nonmiss-mask while you're at it.
 		if loss_class == tf.keras.losses.CategoricalCrossentropy or loss_class == tf.keras.losses.KLDivergence:
 
 			def loss_func(y_pred, y_true):
@@ -715,7 +748,7 @@ if __name__ == "__main__":
 		except:
 			resume_from = False
 
-		ds_args = {"batch_size" : batch_size,
+		ds_args = {"batch_size" : global_batch_size,
 		           "outprefix"  : tfr_prefix,
 		           "valid_split": validation_split,
 		           "sparsifies" : sparsifies,
@@ -725,27 +758,26 @@ if __name__ == "__main__":
 		n_unique_train_samples = copy.deepcopy(dg.n_train_samples)
 		n_valid_samples = copy.deepcopy(dg.n_valid_samples)
 
-		dg.dataset_train=strat.experimental_distribute_dataset(dg.dataset_train)
-		if dg.dataset_valid is not None:
-			dg.dataset_valid=strat.experimental_distribute_dataset(dg.dataset_valid)
-
 		# TODO: i don't understand what this commented block is for,
 		#       will prob remove or reimplement later
+		# TODO: upd: it's for when we want to only take a fraction of train samples.
+		#       should be done at the level of data generator though.
+		#       as an arg to create_tf_dataset.
 		#if "n_samples" in train_opts.keys() and int(train_opts["n_samples"]) > 0:
 		#	n_train_samples = int(train_opts["n_samples"])
 		#else:
 		#	n_train_samples = n_unique_train_samples
 		n_train_samples = copy.deepcopy(n_unique_train_samples)
 
+		global_batch_size_valid = global_batch_size
 		batch_size_valid = batch_size
 		# TODO: double-check if these batch sizes are consistent with dg.
 		#       maybe we can even put get_batches() in there as a method.
+		#       google, how to get number of batches in a tf.data.Dataset obj?
 		(n_train_batches,
-		 n_train_samples_last_batch) = get_batches(n_train_samples,
-		                                           batch_size//num_workers)
+		 n_train_samples_last_batch) = get_batches(n_train_samples, batch_size)
 		(n_valid_batches,
-		 n_valid_samples_last_batch) = get_batches(n_valid_samples,
-		                                           batch_size_valid//num_workers)
+		 n_valid_samples_last_batch) = get_batches(n_valid_samples, batch_size_valid)
 
 		train_times  = []
 		train_epochs = []
@@ -779,37 +811,41 @@ if __name__ == "__main__":
 		chief_print("N markers: {0}".format(n_markers))
 		chief_print("")
 
-		with strat.scope(): # TODO: what should be put into strat scope, again??...
+		with strat.scope():
 			autoencoder = Autoencoder(model_architecture, n_markers,
 			                          noise_std, regularizer)
 			optimizer = tf.optimizers.Adam(learning_rate = lr_schedule)
+			# TODO: loss functions & other metrics should also be defined in strat scope!
+			dg.dataset_train=strat.experimental_distribute_dataset(dg.dataset_train)
+			if dg.dataset_valid is not None:
+				dg.dataset_valid=strat.experimental_distribute_dataset(dg.dataset_valid)
 
-			# get a single batch to:
-			# a) run through optimization to reload weights and optimizer variables,
-			# b) print layer dims
-			input_init, targets_init, _ = next(dg.dataset_train.as_numpy_iterator())
+		# get a single batch to:
+		# a) run through optimization to reload weights and optimizer variables,
+		# b) print layer dims
+		input_init, targets_init, _ = next(dg.dataset_train.as_numpy_iterator())
 
-			if resume_from:
-				chief_print("\n______________________________ Resuming training from epoch {0} ______________________________".format(resume_from))
-				weights_file_prefix = os.path.join(train_directory, "weights", str(resume_from))
-				chief_print("Reading weights from {0}".format(weights_file_prefix))
+		if resume_from:
+			chief_print("\n______________________________ Resuming training from epoch {0} ______________________________".format(resume_from))
+			weights_file_prefix = os.path.join(train_directory, "weights", str(resume_from))
+			chief_print("Reading weights from {0}".format(weights_file_prefix))
 
-				# This initializes the variables used by the optimizers,
-				# as well as any stateful metric variables
-				run_optimization(autoencoder, optimizer, loss_func,
-				                 input_init[0,:], targets_init[0,:])
-				autoencoder.load_weights(weights_file_prefix)
+			# This initializes the variables used by the optimizers,
+			# as well as any stateful metric variables
+			train_step_distrib(autoencoder, optimizer, loss_func,
+			                   input_init[0,:], targets_init[0,:])
+			autoencoder.load_weights(weights_file_prefix)
 
-			chief_print("\n______________________________ Train ______________________________")
+		chief_print("\n______________________________ Train ______________________________")
 
-			# a small run-through of the model with just 2 samples for printing the dimensions of the layers (verbose=True)
-			chief_print("Model layers and dimensions:")
-			chief_print("-----------------------------")
-			_, _ = autoencoder(input_init[:2,:], is_training=False, verbose=True)
+		# a small run-through of the model with just 2 samples for printing the dimensions of the layers (verbose=True)
+		chief_print("Model layers and dimensions:")
+		chief_print("-----------------------------")
+		_, _ = autoencoder(input_init[:2,:], is_training=False, verbose=True)
 
 		######### Create objects for tensorboard summary ###############################
 
-		if isChief:
+		if isChief: # TODO: make sure only chief can write to it
 			twdir = os.path.join(train_directory, "train")
 			vwdir = os.path.join(train_directory, "valid")
 			train_writer = tf.summary.create_file_writer(twdir)
@@ -835,9 +871,9 @@ if __name__ == "__main__":
 
 			for batch_input, batch_target, _ in dg.dataset_train:
 				# TODO: replace with distributed train step! (all occurencies)
-				train_batch_loss = run_optimization(autoencoder,
-				                                    optimizer, loss_func,
-				                                    batch_input, batch_target)
+				train_batch_loss = train_step_distrib(autoencoder,
+				                                      optimizer, loss_func,
+				                                      batch_input, batch_target)
 				losses_t_batches.append(train_batch_loss)
 				step_counter += 1
 			train_loss_this_epoch = np.average(losses_t_batches)
@@ -961,27 +997,28 @@ if __name__ == "__main__":
 		chief_print("Projecting epochs: {0}".format(epochs))
 		chief_print("Already projected: {0}".format(projected_epochs))
 
-		batch_size_project = 50  # TODO: this should be adjustable.
+		batch_size_project = global_batch_size
 		sparsify_fraction = 0.0
 
 		ds_args = {"batch_size" :     batch_size_project,
 		           "outprefix"  :     tfr_prefix,
 		           "valid_split":     0.0,
 		           "sparsifies" :     [sparsify_fraction],
-		           "num_workers":     num_workers,
+		           "num_workers":     1,
 		           "shuffle_dataset": False} # TODO: auto chunk size!
 		dg.create_tf_dataset(**ds_args)
+
+		with strat.scope():
+			autoencoder = Autoencoder(model_architecture, n_markers,
+			                          noise_std, regularizer)
+			genotype_concordance_metric = GenotypeConcordance()
+			dg.dataset_train=strat.experimental_distribute_dataset(dg.dataset_train)
 
 		# loss function of the train set per epoch
 		losses_train = []
 
 		# genotype concordance of the train set per epoch
 		genotype_concs_train = []
-
-		autoencoder = Autoencoder(model_architecture, n_markers, noise_std, regularizer)
-		optimizer = tf.optimizers.Adam(learning_rate = learning_rate)
-
-		genotype_concordance_metric = GenotypeConcordance()
 
 		scatter_points_per_epoch = []
 		colors_per_epoch = []
