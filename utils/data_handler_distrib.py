@@ -109,18 +109,64 @@ class data_generator_distrib:
 		self.dataset_valid = ds_valid
 
 
+	def create_dataset_from_pq(self, input_context, split="all"):
+
+		if split not in ("all", "train", "valid"):
+			raise ValueError("Invalid split argument: "+
+			                 "must be 'all', 'train' or 'valid'")
+
+		self.define_validation_set(validation_split = self.valid_split,
+		                           random_state = self.valid_random_state)
+
+		def ds_from_pq_generator(files):
+			gen_outshapes = (
+				tf.TensorSpec(shape=(None, self.n_markers),
+				              dtype=tf.as_dtype(self.geno_dtype)),
+				tf.TensorSpec(shape=(None, 2), dtype=tf.string),
+				tf.TensorSpec(shape=(1, 1), dtype=tf.bool)
+			)
+			gen_args = (files, split, batch_size,
+			            self.pref_chunk_size, self.shuffle_dataset)
+			ds_ = tf.data.Dataset.from_generator(self.generator_from_parquet,
+			                                     output_signature=gen_outshapes,
+			                                     args=gen_args)
+			return ds_
+
+		num_workers = input_context.num_input_pipelines
+		worker_id   = input_context.input_pipeline_id
+		batch_size  = input_context.get_per_replica_batch_size(self.global_batch_size)
+
+		pq_paths = sorted(glob.glob(self.filebase+"*.parquet"))
+
+		ds = tf.data.Dataset.from_tensor_slices(filenames=pq_paths)
+		ds = ds.shard(num_workers, worker_id)
+		ds = ds.interleave(ds_from_pq_generator,
+		                   num_parallel_calls=tf.data.AUTOTUNE,
+		                   cycle_length=num_workers, block_length=1)
+		ds = ds.prefetch(tf.data.AUTOTUNE)
+		ds = ds.map(self._mask_and_sparsify,
+		            num_parallel_calls=tf.data.AUTOTUNE)
+		return ds
+
+
 	def parquet_to_tfrecords(self):
 		if self.pref_chunk_size is None:
 			# TODO: auto select
 			pass
 
+		pq_paths = sorted(glob.glob(self.filebase+"*.parquet"))
 		gen_outshapes = (
 			tf.TensorSpec(shape=(None, self.n_markers),
 			              dtype=tf.as_dtype(self.geno_dtype)),
 			tf.TensorSpec(shape=(None, 2), dtype=tf.string),
 			tf.TensorSpec(shape=(1, 1), dtype=tf.bool)
 		)
-		gen_args = (self.pref_chunk_size, self.batch_shards, False)
+		if self.batch_chunks:
+			gen_batch_size_ = min(self.global_batch_size, self.pref_chunk_size)
+		else:
+			gen_batch_size_ = self.pref_chunk_size
+		gen_args = (pq_paths, "all", gen_batch_size_,
+		            self.pref_chunk_size, False)
 		# TODO: apparently this makes all workers read all parquet files -_-
 		#       possible solution: shard list on input files, then interleave
 		#       with generator_from_parquet but make it take a list of files
@@ -139,25 +185,32 @@ class data_generator_distrib:
 			self.write_TFRecords(ds)
 
 
-	def generator_from_parquet(self, pref_chunk_size_, batch_chunks, shuffle_):
+	def generator_from_parquet(self, filepaths, split_, gen_batch_size,
+	                           pref_chunk_size_, shuffle_):
 		# handle data loading
 		# https://www.tensorflow.org/guide/data
 		# https://stackoverflow.com/q/68164440
 
-		n_samples = self.n_total_samples
-		cur_sample_idx = tf.cast(np.copy(self.sample_idx_all), tf.int32)
+		if   split_ == "all":
+			n_samples = self.n_total_samples
+			cur_sample_idx = np.copy(self.sample_idx_all)
+		elif split_ == "train":
+			n_samples = self.n_train_samples
+			cur_sample_idx = np.copy(self.sample_idx_train)
+		elif split_ == "valid":
+			n_samples = self.n_valid_samples
+			cur_sample_idx = np.copy(self.sample_idx_valid)
+		else:
+			raise ValueError("Invalid split_ argument: "+
+			                 "must be 'all', 'train' or 'valid'")
+
+		cur_sample_idx = tf.cast(cur_sample_idx, tf.int32)
 		if shuffle_:
 			cur_sample_idx = tf.random.shuffle(cur_sample_idx)
 
-		if batch_chunks:
-			gen_batch_size = min(self.global_batch_size, pref_chunk_size_)
-		else:
-			gen_batch_size = pref_chunk_size_
-
 		# TODO: make sure to properly support multiple files, everywhere
-		pq_paths = sorted(glob.glob(self.filebase+"*.parquet"))
 		int32_t_MAX = 2**31-1
-		pqds = pq.ParquetDataset(path_or_paths = pq_paths,
+		pqds = pq.ParquetDataset(path_or_paths = filepaths,
 		                         thrift_string_size_limit = int32_t_MAX,
 		                         thrift_container_size_limit = int32_t_MAX,
 		                         use_legacy_dataset = False)
@@ -210,7 +263,7 @@ class data_generator_distrib:
 				yield batch_genos, batch_indpop, last_batch_in_chunk
 
 
-	def _normalize(self, genos, indpop, last_batch):
+	def _normalize(self, genos, indpop, *args):
 		"""normalize and insert missing value"""
 
 		where_missing = tf.where(genos==9)
@@ -248,7 +301,7 @@ class data_generator_distrib:
 			raise ValueError("Unknown normalization mode: "+
 			                f"{self.normalization_mode}")
 
-		return genos, indpop, last_batch
+		return genos, indpop, *args
 
 
 	def write_TFRecords(self, dataset):
@@ -355,7 +408,7 @@ class data_generator_distrib:
 		return ds_train_, ds_valid_
 
 
-	def _mask_and_sparsify(self, genos, indpop):
+	def _mask_and_sparsify(self, genos, indpop, *args):
 
 		sparsify = False
 		if len(self.sparsifies) > 0:
@@ -395,7 +448,7 @@ class data_generator_distrib:
 			inputs = tf.expand_dims(inputs, axis=-1)
 
 		# genos will serve as targets
-		return inputs, genos, indpop
+		return inputs, genos, indpop, *args
 
 
 def get_most_common_genotypes(genos_):
