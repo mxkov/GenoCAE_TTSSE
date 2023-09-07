@@ -1,3 +1,4 @@
+from dataclasses import dataclass, field
 import glob
 import numpy as np
 import os
@@ -11,22 +12,33 @@ import utils.normalization as normalization
 # TODO: also, doesn't make sense to convert to tfrecords if you only want to project.
 #       feed a `training` arg to create_tf_dataset and add an option to skip that.
 
-
+@dataclass
 class data_generator_distrib:
 	"""docstring""" # TODO: DOCS & comments
+	filebase:              str
+	tfrecords_prefix:      str
+	global_batch_size:     int
+	geno_dtype:            type = np.float32
+	missing_mask:          bool = True
+	# Validation options
+	valid_split:           float= 0.2
+	valid_random_state:    int  = None
+	# Pre-processing options
+	impute_missing:        bool = False
+	normalization_mode:    str  = "genotypewise01"
+	normalization_options: dict = field(default_factory=lambda: {
+	                              "flip": False, "missing_val": -1.0})
+	sparsifies:            list[float] = field(default_factory=list)
+	# Parquet-to-TFRecords conversion options
+	pref_chunk_size:       int  = None
+	batch_shards:          bool = False
+	overwrite_tfrecords:   bool = False
+	# tf.data.Dataset options
+	shuffle_dataset:       bool = True
+	shuffle_dataset_seed:  int  = None
 
-	def __init__(self, filebase,
-	             missing_mask=True, impute_missing=False,
-	             normalization_mode="genotypewise01",
-	             normalization_options={"flip": False,
-	                                    "missing_val": -1.0}):
-		self.filebase = filebase
-		self.missing_mask = missing_mask
-		self.impute_missing = impute_missing
-		self.missing_val = normalization_options["missing_val"]
-		self.normalization_mode = normalization_mode
-		self.normalization_options = normalization_options
-		# maybe take & set more attrs here
+	def __post_init__(self):
+		self.missing_val  = self.normalization_options["missing_val"]
 		self.total_chunks = None
 
 		self._get_ind_pop_list()
@@ -43,6 +55,7 @@ class data_generator_distrib:
 	def _get_n_markers(self):
 		self.n_markers = 0
 		bim_files = sorted(glob.glob(self.filebase+"*.bim"))
+		# TODO: with parquet, there's a single unique bim file
 		for file in bim_files:
 			self.n_markers += len(np.genfromtxt(file, usecols=(1), dtype=str))
 
@@ -60,49 +73,44 @@ class data_generator_distrib:
 
 
 	# The most important method to be called from outer scope
-	def create_tf_dataset(self, batch_size, outprefix,
-	                      valid_split=0.2, valid_random_state=None,
-	                      geno_dtype=np.float32, sparsifies=[],
-	                      num_workers=1,
-	                      batch_shards=False, pref_chunk_size=None,
-	                      shuffle_tfrecords=False, shuffle_dataset=True,
-	                      overwrite_tfrecords=False):
-
-		self.batch_size   = batch_size
-		self.outprefix    = outprefix
-		self.valid_split  = valid_split
-		self.geno_dtype   = geno_dtype
-		self.sparsifies   = sparsifies
-		self.num_workers  = num_workers
-		self.batch_shards = batch_shards
+	def create_tf_dataset(self, input_context):
+		# input_context:
+		# https://www.tensorflow.org/api_docs/python/tf/distribute/InputContext
+		# https://www.tensorflow.org/tutorials/distribute/input#tfdistributestrategydistribute_datasets_from_function
+		#
+		num_workers = input_context.num_input_pipelines
+		worker_id   = input_context.input_pipeline_id
+		batch_size  = input_context.get_per_replica_batch_size(self.global_batch_size)
+		#num_devices = input_context.num_replicas_in_sync
 		# TODO: could set one dtype for tfrecords and another for loading them
 
-		existing_tfr_files = sorted(glob.glob(self.outprefix+"*.tfrecords"))
-		if len(existing_tfr_files) == 0 or overwrite_tfrecords:
-			self.parquet_to_tfrecords(pref_chunk_size_ = pref_chunk_size,
-			                          shuffle_ = shuffle_tfrecords)
+		existing_tfr_files=sorted(glob.glob(self.tfrecords_prefix+"*.tfrecords"))
+		if len(existing_tfr_files) == 0 or self.overwrite_tfrecords:
+			self.parquet_to_tfrecords()
 
-		current_tfr_files = sorted(glob.glob(self.outprefix+"*.tfrecords"))
+		current_tfr_files=sorted(glob.glob(self.tfrecords_prefix+"*.tfrecords"))
 		ds = tf.data.Dataset.from_tensor_slices(filenames=current_tfr_files)
 
-		worker_id = int(os.environ["SLURM_PROCID"])
-		ds = ds.shard(self.num_workers, worker_id)
+		#worker_id = int(os.environ["SLURM_PROCID"])
+		ds = ds.shard(num_workers, worker_id)
 		ds = ds.interleave(tf.data.TFRecordDataset,
 		                   num_parallel_calls=tf.data.AUTOTUNE,
-		                   cycle_length=self.num_workers, block_length=1)
+		                   cycle_length=num_workers, block_length=1)
 		ds = ds.map(lambda d: decode_example(d, geno_dtype=self.geno_dtype),
 		            num_parallel_calls=tf.data.AUTOTUNE)
-		if shuffle_dataset:
-			ds = ds.shuffle(buffer_size=self.n_total_samples)
+		if self.shuffle_dataset:
+			ds = ds.shuffle(buffer_size = self.n_total_samples,
+			                seed = self.shuffle_dataset_seed)
 
-		self.define_validation_set(random_state=valid_random_state)
-		ds_train, ds_valid = self.finalize_train_valid_sets(ds)
+		self.define_validation_set(validation_split = self.valid_split,
+		                           random_state = self.valid_random_state)
+		ds_train, ds_valid = self.finalize_train_valid_sets(ds, batch_size)
 		self.dataset_train = ds_train
 		self.dataset_valid = ds_valid
 
 
-	def parquet_to_tfrecords(self, pref_chunk_size_=None, shuffle_=False):
-		if pref_chunk_size_ is None:
+	def parquet_to_tfrecords(self):
+		if self.pref_chunk_size is None:
 			# TODO: auto select
 			pass
 
@@ -112,7 +120,10 @@ class data_generator_distrib:
 			tf.TensorSpec(shape=(None, 2), dtype=tf.string),
 			tf.TensorSpec(shape=(1, 1), dtype=tf.bool)
 		)
-		gen_args = (pref_chunk_size_, shuffle_)
+		gen_args = (self.pref_chunk_size, self.batch_shards, False)
+		# TODO: apparently this makes all workers read all parquet files -_-
+		#       possible solution: shard list on input files, then interleave
+		#       with generator_from_parquet but make it take a list of files
 		ds = tf.data.Dataset.from_generator(self.generator_from_parquet,
 		                                    output_signature=gen_outshapes,
 		                                    args=gen_args)
@@ -128,7 +139,7 @@ class data_generator_distrib:
 			self.write_TFRecords(ds)
 
 
-	def generator_from_parquet(self, pref_chunk_size_, shuffle_):
+	def generator_from_parquet(self, pref_chunk_size_, batch_chunks, shuffle_):
 		# handle data loading
 		# https://www.tensorflow.org/guide/data
 		# https://stackoverflow.com/q/68164440
@@ -138,8 +149,8 @@ class data_generator_distrib:
 		if shuffle_:
 			cur_sample_idx = tf.random.shuffle(cur_sample_idx)
 
-		if self.batch_shards:
-			gen_batch_size = min(self.batch_size, pref_chunk_size_)
+		if batch_chunks:
+			gen_batch_size = min(self.global_batch_size, pref_chunk_size_)
 		else:
 			gen_batch_size = pref_chunk_size_
 
@@ -241,7 +252,7 @@ class data_generator_distrib:
 
 
 	def write_TFRecords(self, dataset):
-		outdir = pathlib.Path(self.outprefix).parent
+		outdir = pathlib.Path(self.tfrecords_prefix).parent
 		if not os.path.isdir(outdir):
 			os.makedirs(outdir)
 
@@ -253,6 +264,10 @@ class data_generator_distrib:
 		# Will have to see how this works out.
 		# Ideally, should have an option to further split a chunk into shards.
 		# For now, will just read smaller chunks if more shards are needed.
+
+		# TODO: mb check/ensure that num_shards > num_workers.
+		#       could also rely on setting num_shards rather than chunk_size.
+		#       or, account for both when auto-chunking.
 
 		batch_count = 0
 		shard_count = 0
@@ -271,7 +286,7 @@ class data_generator_distrib:
 				continue
 
 			shard_id = str(shard_count).zfill(zfill_len)
-			shard_filename = f"{self.outprefix}_{shard_id}.tfrecords"
+			shard_filename = f"{self.tfrecords_prefix}_{shard_id}.tfrecords"
 			writer = tf.io.TFRecordWriter(shard_filename)
 			# TODO: compression maybe?
 
@@ -285,9 +300,9 @@ class data_generator_distrib:
 			writer.close()
 
 
-	def define_validation_set(self, random_state=None):
+	def define_validation_set(self, validation_split, random_state=None):
 		# TODO: should be stratified by population in the general case
-		self.n_valid_samples = np.floor(self.n_total_samples*self.valid_split)
+		self.n_valid_samples = np.floor(self.n_total_samples * validation_split)
 		self.n_train_samples = self.n_total_samples - self.n_valid_samples
 
 		np.random.seed(random_state)
@@ -304,7 +319,7 @@ class data_generator_distrib:
 		self.ind_pop_list_valid=np.copy(self.ind_pop_list[self.sample_idx_valid,:])
 
 
-	def finalize_train_valid_sets(self, dataset):
+	def finalize_train_valid_sets(self, dataset, batch_size_):
 
 		def filter_by_indpop(ds_, ind_pop_list_):
 			return ds_.filter(lambda genos,indpop: indpop.numpy().astype("str")\
@@ -319,7 +334,7 @@ class data_generator_distrib:
 
 		def finalize_split(ds_):
 			ds_ = ds_.prefetch(tf.data.AUTOTUNE)
-			ds_ = ds_.batch(self.batch_size//self.num_workers)
+			ds_ = ds_.batch(batch_size_)
 			ds_ = ds_.map(self._mask_and_sparsify,
 			              num_parallel_calls=tf.data.AUTOTUNE)
 			return ds_
