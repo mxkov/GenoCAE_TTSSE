@@ -752,7 +752,7 @@ if __name__ == "__main__":
 		           "outprefix"  : tfr_prefix,
 		           "valid_split": validation_split,
 		           "sparsifies" : sparsifies,
-		           "num_workers": num_workers} # TODO: auto chunk size!
+		           "num_workers": num_workers}
 		dg.create_tf_dataset(**ds_args)
 
 		n_unique_train_samples = copy.deepcopy(dg.n_train_samples)
@@ -1005,7 +1005,7 @@ if __name__ == "__main__":
 		           "valid_split":     0.0,
 		           "sparsifies" :     [sparsify_fraction],
 		           "num_workers":     1,
-		           "shuffle_dataset": False} # TODO: auto chunk size!
+		           "shuffle_dataset": False}
 		dg.create_tf_dataset(**ds_args)
 
 		with strat.scope():

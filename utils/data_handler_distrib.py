@@ -3,6 +3,7 @@ import glob
 import numpy as np
 import os
 import pathlib
+from psutil import virtual_memory
 import pyarrow.parquet as pq
 import scipy
 import tensorflow as tf
@@ -118,6 +119,10 @@ class data_generator_distrib:
 		self.define_validation_set(validation_split = self.valid_split,
 		                           random_state = self.valid_random_state)
 
+		if self.pref_chunk_size is None:
+			self.pref_chunk_size = auto_chunk_size(width=self.n_markers,
+			                                       dtype=self.geno_dtype)
+
 		def ds_from_pq_generator(files):
 			gen_outshapes = (
 				tf.TensorSpec(shape=(None, self.n_markers),
@@ -150,21 +155,23 @@ class data_generator_distrib:
 
 
 	def parquet_to_tfrecords(self):
-		if self.pref_chunk_size is None:
-			# TODO: auto select
-			pass
 
 		pq_paths = sorted(glob.glob(self.filebase+"*.parquet"))
+
+		if self.pref_chunk_size is None:
+			self.pref_chunk_size = auto_chunk_size(width=self.n_markers,
+			                                       dtype=self.geno_dtype)
+		if self.batch_chunks:
+			gen_batch_size_ = min(self.global_batch_size, self.pref_chunk_size)
+		else:
+			gen_batch_size_ = self.pref_chunk_size
+
 		gen_outshapes = (
 			tf.TensorSpec(shape=(None, self.n_markers),
 			              dtype=tf.as_dtype(self.geno_dtype)),
 			tf.TensorSpec(shape=(None, 2), dtype=tf.string),
 			tf.TensorSpec(shape=(1, 1), dtype=tf.bool)
 		)
-		if self.batch_chunks:
-			gen_batch_size_ = min(self.global_batch_size, self.pref_chunk_size)
-		else:
-			gen_batch_size_ = self.pref_chunk_size
 		gen_args = (pq_paths, "all", gen_batch_size_,
 		            self.pref_chunk_size, False)
 		# TODO: apparently this makes all workers read all parquet files -_-
@@ -485,3 +492,13 @@ def decode_example(x, geno_dtype=np.float32):
 	indpop_ = tf.io.parse_tensor(example['indpop'],
 	                             out_type=tf.string)
 	return genos_, indpop_
+
+
+def auto_chunk_size(width, dtype, k=0.7):
+	if k >= 1.0 or k <= 0:
+		raise ValueError("Invalid k argument: should lie between 0 and 1")
+
+	max_ram = k*virtual_memory().available
+	bytes_per_val = np.dtype(dtype).itemsize
+	chunksize = np.floor(max_ram / (bytes_per_val * width))
+	return chunksize
