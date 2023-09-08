@@ -1,1 +1,14 @@
+# Singularity containers (too big)
+*.sif
+# Singularity logs, build files w/o Tensorflow, etc.
+singularity/*
+!singularity/build.def
+
+# Python cache
+*__pycache__
+
+# Output dirs
+ae_out*
+
+# Other
 .vscode/
