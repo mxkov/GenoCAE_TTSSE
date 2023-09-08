@@ -7,7 +7,6 @@ from psutil import virtual_memory
 import pyarrow.parquet as pq
 import scipy
 import tensorflow as tf
-import utils.normalization as normalization
 
 # TODO: backwards compatibility with PLINK / EIGENSTRAT
 # TODO: also, doesn't make sense to convert to tfrecords if you only want to project.
@@ -19,6 +18,7 @@ class data_generator_distrib:
 	filebase:              str
 	tfrecords_prefix:      str
 	global_batch_size:     int
+	drop_inds_file:        str  = None
 	geno_dtype:            type = np.float32
 	missing_mask:          bool = True
 	# Validation options
@@ -46,12 +46,31 @@ class data_generator_distrib:
 		self._get_n_markers()
 		self._define_samples()
 
+
 	def _get_ind_pop_list(self):
+		if self.drop_inds_file is not None:
+			dropdata  = np.genfromtxt(self.drop_inds_file, usecols=(0,1),
+			                          dtype=str, delimiter=",")
+			drop_cols = dropdata[:,0].astype(np.int32)
+			drop_vals = dropdata[:,1]
+		else:
+			dropdata  = None
+
+		def drop_inds(indpop_):
+			for i in range(len(drop_cols)):
+				keep = indpop_[:,drop_cols[i]]!=drop_vals[i]
+				indpop_ = indpop_[keep]
+			return indpop_
+
 		self.ind_pop_list = np.empty(shape=(0,2), dtype=str)
 		fam_files = sorted(glob.glob(self.filebase+"*.fam"))
 		for file in fam_files:
-			indpop = np.genfromtxt(file, usecols=(1,0), dtype=str)
+			indpop = np.genfromtxt(file, dtype=str)
+			if dropdata:
+				indpop = drop_inds(indpop)
+			indpop = indpop[:,[1,0]]
 			self.ind_pop_list=np.concatenate((self.ind_pop_list,indpop), axis=0)
+
 
 	def _get_n_markers(self):
 		self.n_markers = 0
@@ -199,21 +218,14 @@ class data_generator_distrib:
 		# https://stackoverflow.com/q/68164440
 
 		if   split_ == "all":
-			n_samples = self.n_total_samples
 			cur_sample_idx = np.copy(self.sample_idx_all)
 		elif split_ == "train":
-			n_samples = self.n_train_samples
 			cur_sample_idx = np.copy(self.sample_idx_train)
 		elif split_ == "valid":
-			n_samples = self.n_valid_samples
 			cur_sample_idx = np.copy(self.sample_idx_valid)
 		else:
 			raise ValueError("Invalid split_ argument: "+
 			                 "must be 'all', 'train' or 'valid'")
-
-		cur_sample_idx = tf.cast(cur_sample_idx, tf.int32)
-		if shuffle_:
-			cur_sample_idx = tf.random.shuffle(cur_sample_idx)
 
 		# TODO: make sure to properly support multiple files, everywhere
 		int32_t_MAX = 2**31-1
@@ -222,10 +234,16 @@ class data_generator_distrib:
 		                         thrift_container_size_limit = int32_t_MAX,
 		                         use_legacy_dataset = False)
 		# OBS! might not preserve column order. rely on schema instead.
-		inds_sch = [entry.name for entry in pqds.schema]
-		inds_fam = list(self.ind_pop_list[:,0])
-		if inds_sch != inds_fam:
+		inds_sch = np.array([entry.name for entry in pqds.schema])
+		inds_fam = self.ind_pop_list[:,0]
+		present_in_files = np.in1d(inds_fam, inds_sch, invert=False)
+		if inds_sch != inds_fam[present_in_files]:
 			raise ValueError("Parquet schema inconsistent with FAM files")
+
+		cur_sample_idx = tf.cast(cur_sample_idx[present_in_files], tf.int32)
+		if shuffle_:
+			cur_sample_idx = tf.random.shuffle(cur_sample_idx)
+		n_samples = len(cur_sample_idx)
 
 		chunk_size = pref_chunk_size_ - pref_chunk_size_ % gen_batch_size
 		self.total_chunks = np.ceil(n_samples / chunk_size)
