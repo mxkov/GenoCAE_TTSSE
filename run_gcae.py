@@ -43,6 +43,7 @@ from datetime import datetime
 from utils.data_handler_distrib import data_generator_distrib # TODO: look into reimplementing all these below as well:
 from utils.data_handler import get_saved_epochs, get_projected_epochs, write_h5, read_h5, get_coords_by_pop, data_generator_ae, convex_hull_error, f1_score_kNN, plot_genotype_hist, to_genotypes_sigmoid_round, to_genotypes_invscale_round, GenotypeConcordance, get_pops_with_k, get_ind_pop_list_from_map, get_baseline_gc, write_metric_per_epoch_to_csv
 from utils.visualization import plot_coords_by_superpop, plot_clusters_by_superpop, plot_coords, plot_coords_by_pop, make_animation, write_f1_scores_to_csv
+from utils.tf_config import set_tf_config
 import utils.visualization
 import utils.layers
 import json
@@ -57,9 +58,6 @@ import copy
 import h5py
 import matplotlib.animation as animation
 from pathlib import Path
-# TODO: set_tf_config. try running a dummy job on Bianca and reading its env vars to figure out the format.
-#       and yes, this func has to be in its own file, for modularity. diff HPCs might require diff custom implementations.
-#       but try making it cluster-agnostic if possible.
 
 
 def _isChief():
@@ -445,7 +443,6 @@ if __name__ == "__main__":
 	if "SLURMD_NODENAME" in os.environ:
 
 		slurm_job = 1
-		# TODO: mind that set_tf_config() is implemented in utils.set_tf_config_berzelius_1_proc_per_gpu
 		addresses, chief, num_workers = set_tf_config()
 		isChief = os.environ["SLURMD_NODENAME"] == chief
 		os.environ["isChief"] = json.dumps(str(isChief)) # TODO
@@ -1426,4 +1423,3 @@ if __name__ == "__main__":
 					plot_coords(encoded_train,
 					            os.path.join(results_directory,
 					                         f"dimred_e_{epoch}"))
-
