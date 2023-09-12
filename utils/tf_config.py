@@ -1,3 +1,4 @@
+import json
 import os
 
 class BadNodelistException(Exception):
@@ -38,15 +39,32 @@ def parse_node_ids(nodes_str):
 		                for n in node_num_range]
 		node_ids += new_node_ids
 
+	node_ids.sort()
 	return node_ids
 
 
-def set_tf_config():
+def set_tf_config(port="8888"):
 
 	nodelist_str = os.environ["SLURM_JOB_NODELIST"]
 	try:
-		nodes = parse_node_ids(nodelist_str)
+		clust = parse_node_ids(nodelist_str)
 	except BadNodelistException:
 		raise ValueError(f"Invalid SLURM_JOB_NODELIST value: {nodelist_str}")
-	# TODO: add ports, then refer to this:
-	# https://www.tensorflow.org/guide/distributed_training#setting_up_the_tf_config_environment_variable
+
+	num_workers   = len(clust)
+	chief_node_id = clust[0]
+
+	current_node_id    = os.environ["SLURMD_NODENAME"]
+	current_node_index = clust.index(current_node_id)
+	current_node_role  = "chief" if current_node_index == 0 else "worker"
+
+	# TODO: fixed port for all nodes for now
+	clust_with_ports = [x+":"+port for x in clust]
+
+	tf_config = {
+	  "cluster": {"worker": clust_with_ports},
+	  "task"   : {"type": current_node_role, "index": current_node_index}
+	}
+	os.environ["TF_CONFIG"] = json.dumps(tf_config)
+
+	return num_workers, chief_node_id

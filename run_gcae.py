@@ -62,16 +62,12 @@ from pathlib import Path
 
 def _isChief():
 	if "isChief" in os.environ:
-		if os.environ["isChief"] == "true":
-			return True
-		else:
-			return False
-	else:
-		return True
+		return os.environ["isChief"] == "1"
+	return True
 
 def chief_print(msg):
 	if "isChief" in os.environ:
-		if os.environ["isChief"] == "true":
+		if os.environ["isChief"] == "1":
 			print(msg)
 	else:
 		print(msg)
@@ -438,14 +434,14 @@ if __name__ == "__main__":
 
 	## Define distribution strategies
 
-	# TODO: handle environment interaction properly!
-
 	if "SLURMD_NODENAME" in os.environ:
 
 		slurm_job = 1
-		addresses, chief, num_workers = set_tf_config()
-		isChief = os.environ["SLURMD_NODENAME"] == chief
-		os.environ["isChief"] = json.dumps(str(isChief)) # TODO
+		#addresses, chief, num_workers = set_tf_config()
+		num_workers, chief_id = set_tf_config()
+		isChief = os.environ["SLURMD_NODENAME"] == chief_id
+		os.environ["isChief"] = json.dumps(int(isChief))
+		# TODO: check if the chief gets correctly identified
 		chief_print("Number of workers: {}".format(num_workers))
 
 		if num_workers > 1 and arguments["train"]:
@@ -466,7 +462,7 @@ if __name__ == "__main__":
 
 	else:
 		isChief = True
-		os.environ["isChief"] = json.dumps(str(isChief)) # TODO
+		os.environ["isChief"] = json.dumps(int(isChief))
 		slurm_job = 0
 		num_workers = 1
 		strat = tfd.MirroredStrategy()
