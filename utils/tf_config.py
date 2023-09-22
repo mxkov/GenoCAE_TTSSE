@@ -33,13 +33,11 @@ def parse_node_ids(nodes_str):
 			raise BadNodelistException()
 		node_num_range = range(int(node_num_range_ends[0]),
 		                       int(node_num_range_ends[1])+1)
-		assert len(node_num_range_ends[0]) == len(node_num_range_ends[1])
-		numlen = len(node_num_range_ends[0])
+		numlen = min([len(x) for x in node_num_range_ends])
 		new_node_ids = [prefix + str(n).zfill(numlen) + suffix
 		                for n in node_num_range]
 		node_ids += new_node_ids
 
-	node_ids.sort()
 	return node_ids
 
 
@@ -56,7 +54,7 @@ def set_tf_config(port="8888"):
 
 	current_node_id    = os.environ["SLURMD_NODENAME"]
 	current_node_index = clust.index(current_node_id)
-	current_node_role  = "chief" if current_node_index == 0 else "worker"
+	current_node_role  = "worker"
 
 	# TODO: fixed port for all nodes for now
 	clust_with_ports = [x+":"+port for x in clust]
