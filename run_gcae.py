@@ -41,7 +41,7 @@ import tensorflow.distribute.experimental as tfde
 from tensorflow.keras import Model, layers
 from datetime import datetime
 from utils.data_handler_distrib import data_generator_distrib # TODO: look into reimplementing all these below as well:
-from utils.data_handler import get_saved_epochs, get_projected_epochs, write_h5, read_h5, get_coords_by_pop, data_generator_ae, convex_hull_error, f1_score_kNN, plot_genotype_hist, to_genotypes_sigmoid_round, to_genotypes_invscale_round, GenotypeConcordance, get_pops_with_k, get_ind_pop_list_from_map, get_baseline_gc, write_metric_per_epoch_to_csv
+from utils.data_handler import get_saved_epochs, get_projected_epochs, write_h5, read_h5, get_coords_by_pop, convex_hull_error, f1_score_kNN, plot_genotype_hist, to_genotypes_sigmoid_round, to_genotypes_invscale_round, GenotypeConcordance, get_pops_with_k, get_ind_pop_list_from_map, get_baseline_gc, write_metric_per_epoch_to_csv
 from utils.visualization import plot_coords_by_superpop, plot_clusters_by_superpop, plot_coords, plot_coords_by_pop, make_animation, write_f1_scores_to_csv
 from utils.tf_config import set_tf_config
 import utils.visualization
@@ -53,6 +53,7 @@ import os
 import glob
 import math
 import matplotlib.pyplot as plt
+import shutil
 import csv
 import copy
 import h5py
@@ -60,7 +61,7 @@ import matplotlib.animation as animation
 from pathlib import Path
 
 
-def _isChief():
+def isChief():
 	if "isChief" in os.environ:
 		return os.environ["isChief"] == "1"
 	return True
@@ -395,19 +396,55 @@ def alfreqvector(y_pred):
 	else:
 		return tf.nn.softmax(y_pred)
 
-def save_ae_weights(epoch, train_directory, autoencoder, prefix=""):
-	weights_file_prefix = os.path.join(train_directory, "weights", f"{prefix}{epoch}")
-	startTime = datetime.now()
-	autoencoder.save_weights(weights_file_prefix, save_format ="tf")
-	save_time = (datetime.now() - startTime).total_seconds()
-	chief_print("-------- Saving weights: {0} time: {1}".format(weights_file_prefix, save_time))
 
-def save_ae_weights_distrib(epoch, train_directory, model, prefix=""):
-	# TODO: rework the function above ^.
+class WeightKeeper:
 	# "Apparently, in order to save the model, the save_model call needs to be made on all processes,
 	# but they cannot be saved to the same file, since that causes a race condition".
-	# https://www.tensorflow.org/tutorials/distribute/save_and_load
-	pass
+	# TODO: maybe hide get_saved_epochs() in here.
+
+	def __init__(self, train_directory, default_prefix=""):
+		chief_weights_dirname = "weights"
+		if isChief():
+			weights_dirname = chief_weights_dirname
+		else:
+			weights_dirname = "weights_tmp_" + os.environ["SLURMD_NODENAME"]
+		weights_dir = os.path.join(train_directory, weights_dirname)
+		if not os.path.isdir(weights_dir):
+			os.makedirs(weights_dir)
+		weights_dir_chief = os.path.join(train_directory, chief_weights_dirname)
+
+		self.train_dir = train_directory
+		self.weights_dir = weights_dir
+		self.weights_dir_chief = weights_dir_chief
+		self.default_prefix = default_prefix
+
+	def get_full_fileprefix(self, epoch_, prefix=None, chief_only=True):
+		if prefix is None:
+			prefix = self.default_prefix
+		wd = self.weights_dir_chief if chief_only else self.weights_dir
+		return os.path.join(wd, f"{prefix}{epoch_}")
+
+	def save(self, model, epoch, update_best=False):
+		if update_best:
+			new_prefix = "min_valid."
+			prev_best_prefix = self.get_full_fileprefix("*", prefix=new_prefix,
+			                                            chief_only=False)
+			for f in glob.glob(prev_best_prefix):
+				os.remove(f)
+		else:
+			new_prefix = self.default_prefix
+		weights_file_prefix = self.get_full_fileprefix(epoch, prefix=new_prefix,
+		                                               chief_only=False)
+		startTime = datetime.now()
+		model.save_weights(weights_file_prefix, save_format ="tf")
+		save_time = (datetime.now() - startTime).total_seconds()
+		chief_print(f"-------- Saving weights: {weights_file_prefix} "+
+		            f"time: {save_time}")
+
+	def cleanup(self):
+		if not isChief():
+			assert self.weights_dir != self.weights_dir_chief
+			shutil.rmtree(self.weights_dir)
 
 
 
@@ -716,6 +753,7 @@ if __name__ == "__main__":
 
 	if arguments['train']:
 
+		ae_weight_manager = WeightKeeper(train_directory)
 		epochs = int(arguments["epochs"])
 
 		try:
@@ -736,7 +774,8 @@ if __name__ == "__main__":
 		try:
 			resume_from = int(arguments["resume_from"])
 			if resume_from < 1:
-				saved_epochs = get_saved_epochs(train_directory)
+				saved_weights_dir = ae_weight_manager.weights_dir_chief
+				saved_epochs = get_saved_epochs(saved_weights_dir)
 				resume_from = saved_epochs[-1]
 		except:
 			resume_from = False
@@ -820,14 +859,16 @@ if __name__ == "__main__":
 
 		if resume_from:
 			chief_print("\n______________________________ Resuming training from epoch {0} ______________________________".format(resume_from))
-			weights_file_prefix = os.path.join(train_directory, "weights", str(resume_from))
-			chief_print("Reading weights from {0}".format(weights_file_prefix))
+			weights_file_prefix = ae_weight_manager.get_full_fileprefix(
+			                                          str(resume_from))
+			chief_print(f"Reading weights from {weights_file_prefix}")
 
 			# This initializes the variables used by the optimizers,
 			# as well as any stateful metric variables
 			train_step_distrib(autoencoder, optimizer, loss_func,
 			                   input_init[0,:], targets_init[0,:])
-			autoencoder.load_weights(weights_file_prefix)
+			with strat.scope():
+				autoencoder.load_weights(weights_file_prefix)
 
 		chief_print("\n______________________________ Train ______________________________")
 
@@ -921,10 +962,8 @@ if __name__ == "__main__":
 					min_valid_loss_epoch = effective_epoch
 
 					if e > start_saving_from:
-						for f in glob.glob(os.path.join(train_directory, "weights", f"min_valid.{prev_min_val_loss_epoch}.*")):
-							os.remove(f)
-						save_ae_weights_distrib(effective_epoch, train_directory,
-						                        autoencoder, prefix = "min_valid.")
+						ae_weight_manager.save(effective_epoch, autoencoder,
+						                       update_best=True)
 
 				evals_since_min_valid_loss = effective_epoch - min_valid_loss_epoch
 				chief_print("--- Valid loss: {:.4f}  time: {} min loss: {:.4f} epochs since: {}".format(valid_loss_this_epoch, valid_time, min_valid_loss, evals_since_min_valid_loss))
@@ -933,10 +972,10 @@ if __name__ == "__main__":
 					break
 
 			if e % save_interval == 0 and e > start_saving_from :
-				save_ae_weights_distrib(effective_epoch, train_directory, autoencoder)
+				ae_weight_manager.save(effective_epoch, autoencoder)
 
 		# TODO: remember to fix STRAT SCOPE
-		save_ae_weights_distrib(effective_epoch, train_directory, autoencoder)
+		ae_weight_manager.save(effective_epoch, autoencoder)
 
 		if isChief:
 			outfilename = os.path.join(train_directory, "train_times.csv")
@@ -964,14 +1003,15 @@ if __name__ == "__main__":
 			plt.close()
 
 		chief_print("Done training. Wrote to {0}".format(train_directory))
+		ae_weight_manager.cleanup()
 
 	if arguments['project']:
+		# TODO: the 'train' suffix in this section is confusing.
 		if not isChief:
 			print("Work has ended for this worker")
 			exit(0)
 
-		# TODO: the 'train' suffix in this section is confusing.
-
+		ae_weight_manager = WeightKeeper(train_directory)
 		projected_epochs = get_projected_epochs(encoded_data_file)
 
 		if arguments['epoch']:
@@ -979,7 +1019,8 @@ if __name__ == "__main__":
 			epochs = [epoch]
 
 		else:
-			epochs = get_saved_epochs(train_directory)
+			saved_weights_dir = ae_weight_manager.weights_dir_chief
+			epochs = get_saved_epochs(saved_weights_dir)
 
 		for projected_epoch in projected_epochs:
 			try:
@@ -1001,6 +1042,9 @@ if __name__ == "__main__":
 		           "shuffle_dataset": False}
 		dg.create_tf_dataset(**ds_args)
 
+		# TODO: we don't need strat scope in this section,
+		#       we terminated all non-chief workers already...
+		#       also global batch size is too much
 		with strat.scope():
 			autoencoder = Autoencoder(model_architecture, n_markers,
 			                          noise_std, regularizer)
@@ -1020,8 +1064,8 @@ if __name__ == "__main__":
 
 		for epoch in epochs:
 			chief_print("########################### epoch {0} ###########################".format(epoch))
-			weights_file_prefix = os.path.join(train_directory, "weights", str(epoch))
-			chief_print("Reading weights from {0}".format(weights_file_prefix))
+			weights_file_prefix=ae_weight_manager.get_full_fileprefix(str(epoch))
+			chief_print(f"Reading weights from {weights_file_prefix}")
 
 			# TODO: find out if we should run 1-2 samples through optimization
 			#       in order to load the weights here.

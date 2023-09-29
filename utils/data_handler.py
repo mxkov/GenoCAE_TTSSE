@@ -745,15 +745,15 @@ def get_coords_by_pop(filestart_fam, coords, pop_subset = None, ind_pop_list = [
 	return coords_by_pop
 
 
-def get_saved_epochs(train_directory):
+def get_saved_epochs(weight_directory):
 	'''
 	Get an ordered list of the saved epochs in the given directory.
 
-	:param train_directory: directory where training data is stored
+	:param weight_directory: directory where saved model weights are stored
 	:return: int list of sorted epochs
 	'''
 	epochs = []
-	for i in os.listdir(train_directory+"/weights"):
+	for i in os.listdir(weight_directory):
 		start = i.split("/")[-1].split(".")[0]
 		try:
 			num = int(start)
