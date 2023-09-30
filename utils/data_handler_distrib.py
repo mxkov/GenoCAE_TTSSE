@@ -16,8 +16,8 @@ import tensorflow as tf
 class data_generator_distrib:
 	"""docstring""" # TODO: DOCS & comments
 	filebase:              str
-	tfrecords_prefix:      str
 	global_batch_size:     int
+	tfrecords_prefix:      str  = ""
 	drop_inds_file:        str  = None
 	geno_dtype:            type = np.float32
 	missing_mask:          bool = True

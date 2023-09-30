@@ -348,6 +348,7 @@ def run_optimization(model, optimizer, loss_function, input, targets):
 	# TODO: "If true, gradients aggregation will not be performed inside optimizer.
 	#        Usually this arg is set to True when you write custom code
 	#        aggregating gradients outside the optimizer. "
+	#        ...maybe for phenomodel?
 	return loss_value
 
 @tf.function
@@ -676,20 +677,6 @@ if __name__ == "__main__":
 				exit(1)
 
 	else:
-		dg = data_generator_distrib(filebase = data_prefix,
-		                            missing_mask = missing_mask_input,
-		                            impute_missing = fill_missing,
-		                            normalization_mode = norm_mode,
-		                            normalization_options = norm_opts)
-		n_markers = copy.deepcopy(dg.n_markers)
-
-		tfr_dir = os.path.join(Path(data_prefix).resolve().parent, "TFRecords")
-		if not os.path.isdir(tfr_dir):
-			try:
-				os.makedirs(tfr_dir)
-			except OSError:
-				pass
-		tfr_prefix = os.path.join(tfr_dir, Path(data_prefix).resolve().name)
 
 		loss_def = train_opts["loss"]
 		loss_class = getattr(eval(loss_def["module"]), loss_def["class"])
@@ -780,12 +767,28 @@ if __name__ == "__main__":
 		except:
 			resume_from = False
 
-		ds_args = {"batch_size" : global_batch_size,
-		           "outprefix"  : tfr_prefix,
-		           "valid_split": validation_split,
-		           "sparsifies" : sparsifies,
-		           "num_workers": num_workers}
-		dg.create_tf_dataset(**ds_args)
+		dg_args = {"filebase"             : data_prefix,
+		           "global_batch_size"    : global_batch_size,
+		           "missing_mask"         : missing_mask_input,
+		           "valid_split"          : validation_split,
+		           "impute_missing"       : fill_missing,
+		           "normalization_mode"   : norm_mode,
+		           "normalization_options": norm_opts,
+		           "sparsifies"           : sparsifies,
+		           "pref_chunk_size"      : None, # auto
+		           "shuffle_dataset"      : True}
+		dg = data_generator_distrib(**dg_args)
+		n_markers = copy.deepcopy(dg.n_markers)
+
+		# dds stands for tfd.DistributedDataset
+		dds_train = strat.distribute_datasets_from_function(
+		                  lambda x: dg.create_dataset_from_pq(x, split="train"))
+		if validation_split > 0.0: # TODO: mb another condition
+			dds_valid = strat.distribute_datasets_from_function(
+			              lambda x: dg.create_dataset_from_pq(x, split="valid"))
+		# TODO: right now, valid set is defined in this method.
+		#       if it gets moved to init or outer scope, we can call these later,
+		#       after setting up lr schedule and such.
 
 		n_unique_train_samples = copy.deepcopy(dg.n_train_samples)
 		n_valid_samples = copy.deepcopy(dg.n_valid_samples)
@@ -794,7 +797,7 @@ if __name__ == "__main__":
 		#       will prob remove or reimplement later
 		# TODO: upd: it's for when we want to only take a fraction of train samples.
 		#       should be done at the level of data generator though.
-		#       as an arg to create_tf_dataset.
+		#       as an arg to dataset creation.
 		#if "n_samples" in train_opts.keys() and int(train_opts["n_samples"]) > 0:
 		#	n_train_samples = int(train_opts["n_samples"])
 		#else:
@@ -848,14 +851,11 @@ if __name__ == "__main__":
 			                          noise_std, regularizer)
 			optimizer = tf.optimizers.Adam(learning_rate = lr_schedule)
 			# TODO: loss functions & other metrics should also be defined in strat scope!
-			dg.dataset_train=strat.experimental_distribute_dataset(dg.dataset_train)
-			if dg.dataset_valid is not None:
-				dg.dataset_valid=strat.experimental_distribute_dataset(dg.dataset_valid)
 
 		# get a single batch to:
 		# a) run through optimization to reload weights and optimizer variables,
 		# b) print layer dims
-		input_init, targets_init, _ = next(dg.dataset_train.as_numpy_iterator())
+		input_init, targets_init, _ = next(dds_train.as_numpy_iterator())
 
 		if resume_from:
 			chief_print("\n______________________________ Resuming training from epoch {0} ______________________________".format(resume_from))
@@ -903,7 +903,7 @@ if __name__ == "__main__":
 			losses_t_batches = []
 			losses_v_batches = []
 
-			for batch_input, batch_target, _ in dg.dataset_train:
+			for batch_input, batch_target, _, _ in dds_train:
 				# TODO: replace with distributed train step! (all occurencies)
 				train_batch_loss = train_step_distrib(autoencoder,
 				                                      optimizer, loss_func,
@@ -939,7 +939,7 @@ if __name__ == "__main__":
 
 				startTime = datetime.now()
 
-				for batch_input_valid, batch_target_valid, _ in dg.dataset_valid:
+				for batch_input_valid, batch_target_valid, _, _ in dds_valid:
 					# TODO: implement this; don't forget training=False
 					valid_loss_batch = get_distrib_losses(autoencoder,
 					                                      loss_func,
@@ -1034,22 +1034,32 @@ if __name__ == "__main__":
 		batch_size_project = global_batch_size
 		sparsify_fraction = 0.0
 
-		ds_args = {"batch_size" :     batch_size_project,
-		           "outprefix"  :     tfr_prefix,
-		           "valid_split":     0.0,
-		           "sparsifies" :     [sparsify_fraction],
-		           "num_workers":     1,
-		           "shuffle_dataset": False}
-		dg.create_tf_dataset(**ds_args)
+		dg_args = {"filebase"             : data_prefix,
+		           "global_batch_size"    : batch_size_project,
+		           "missing_mask"         : True,
+		           "valid_split"          : 0.0,
+		           "impute_missing"       : fill_missing,
+		           "normalization_mode"   : norm_mode,
+		           "normalization_options": norm_opts,
+		           "sparsifies"           : [sparsify_fraction],
+		           "pref_chunk_size"      : None, # auto
+		           "shuffle_dataset"      : False}
+		dg = data_generator_distrib(**dg_args)
+
+		# dds stands for tfd.DistributedDataset
+		dds_proj = strat.distribute_datasets_from_function(
+		                    lambda x: dg.create_dataset_from_pq(x, split="all"))
 
 		# TODO: we don't need strat scope in this section,
 		#       we terminated all non-chief workers already...
 		#       also global batch size is too much
+		# TODO: actually we do need the strat.
+		#       so we can properly finalize the dataset.
+		#       that was avoidable, but whoops, too late.
 		with strat.scope():
 			autoencoder = Autoencoder(model_architecture, n_markers,
 			                          noise_std, regularizer)
 			genotype_concordance_metric = GenotypeConcordance()
-			dg.dataset_train=strat.experimental_distribute_dataset(dg.dataset_train)
 
 		# loss function of the train set per epoch
 		losses_train = []
@@ -1076,13 +1086,11 @@ if __name__ == "__main__":
 			decoded_train = None
 			targets_train = np.empty((0, n_markers))
 			mask = np.empty((0, n_markers))
-			# TODO: ^ this assumes that missing_mask_input is always True when projecting!
-			#       and also makes it impossible to use sparsify when projecting, which should be pointed out.
 
 			loss_value_per_batch = []
 			genotype_conc_per_batch = []
 
-			for batch_input, batch_target, batch_indpop in dg.dataset_train:
+			for batch_input, batch_target, batch_indpop, _ in dds_proj:
 
 				# TODO: check how the mask dimension is handled here!
 				#       and wherever else dg batches are used
