@@ -324,7 +324,8 @@ class Autoencoder(Model):
 		return x
 
 @tf.function
-def run_optimization(model, optimizer, loss_function, input, targets):
+def run_optimization(model, optimizer, loss_function,
+                     input, targets, mask):
 	'''
 	Run one step of optimization process based on the given data.
 
@@ -337,7 +338,8 @@ def run_optimization(model, optimizer, loss_function, input, targets):
 	'''
 	with tf.GradientTape() as g:
 		output, encoded_data = model(input, is_training=True)
-		loss_value  = loss_function(y_pred = output, y_true = targets)
+		loss_value  = loss_function(y_pred = output, y_true = targets,
+		                            orig_nonmissing_mask = mask)
 		loss_value += tf.nn.scale_regularization_loss(sum(model.losses))
 		# TODO: ^ read more abt this function
 
@@ -352,11 +354,12 @@ def run_optimization(model, optimizer, loss_function, input, targets):
 	return loss_value
 
 @tf.function
-def train_step_distrib(model_, optimizer_, loss_function_, input_, targets_):
+def train_step_distrib(model_, optimizer_, loss_function_,
+                       input_, targets_, mask_):
 
 	per_replica_losses = strat.run(run_optimization,
 	                               args=(model_, optimizer_, loss_function_,
-	                                     input_, targets_))
+	                                     input_, targets_, mask_))
 	loss = strat.reduce("SUM", per_replica_losses, axis=None)
 
 	return loss 
@@ -588,17 +591,16 @@ if __name__ == "__main__":
 
 	norm_opts = data_opts["norm_opts"]
 	norm_mode = data_opts["norm_mode"]
+	missing_mask_input = data_opts["missing_mask"]
 	validation_split = data_opts["validation_split"]
 
 	if "sparsifies" in data_opts.keys():
 		sparsify_input = True
-		missing_mask_input = True # TODO: make this a separate option
 		n_input_channels = 2
 		sparsifies = data_opts["sparsifies"]
 
 	else:
 		sparsify_input = False
-		missing_mask_input = False
 		n_input_channels = 1
 		sparsifies = []
 
@@ -612,7 +614,6 @@ if __name__ == "__main__":
 		chief_print("Imputing originally missing genotypes to most common value.")
 	else:
 		chief_print("Keeping originally missing genotypes.")
-		missing_mask_input = True
 		n_input_channels = 2
 
 	if not train_directory:
@@ -686,33 +687,11 @@ if __name__ == "__main__":
 			loss_args = dict()
 		loss_obj = loss_class(**loss_args)
 
-		def get_originally_nonmissing_mask(genos):
-			'''
-			Get a boolean mask representing missing values in the data.
-			Missing value is represented by float(norm_opts["missing_val"]).
-
-			Uses the presence of missing_val in the true genotypes as indicator, missing_val should not be set to
-			something that can exist in the data set after normalization!!!!
-
-			:param genos: (n_samples x n_markers) genotypes
-			:return: boolean mask of the same shape as genos
-			'''
-			# TODO: maybe we don't need this.
-			#       just get a mask from dg, then extract it into a sparse tensor and multiply by genos.
-			#       but then we'll need to rethink how we set missing_mask_input.
-			orig_nonmissing_mask = tf.not_equal(genos, float(norm_opts["missing_val"]))
-
-			return orig_nonmissing_mask
-
 		# TODO: marry the losses with strat scope.
-		#       + sort out the thing with get-orig-nonmiss-mask while you're at it.
 		if loss_class == tf.keras.losses.CategoricalCrossentropy or loss_class == tf.keras.losses.KLDivergence:
 
-			def loss_func(y_pred, y_true):
+			def loss_func(y_pred, y_true, orig_nonmissing_mask):
 				y_pred = y_pred[:, 0:n_markers]
-
-				if not fill_missing:
-					orig_nonmissing_mask = get_originally_nonmissing_mask(y_true)
 
 				y_pred = alfreqvector(y_pred)
 				y_true = tf.one_hot(tf.cast(y_true * 2, tf.uint8), 3)*0.9997 + 0.0001
@@ -725,13 +704,12 @@ if __name__ == "__main__":
 
 
 		else:
-			def loss_func(y_pred, y_true):
+			def loss_func(y_pred, y_true, orig_nonmissing_mask):
 
 				y_pred = y_pred[:, 0:n_markers]
 				y_true = tf.convert_to_tensor(y_true)
 
 				if not fill_missing:
-					orig_nonmissing_mask = get_originally_nonmissing_mask(y_true)
 					y_pred = y_pred[orig_nonmissing_mask]
 					y_true = y_true[orig_nonmissing_mask]
 
@@ -855,7 +833,8 @@ if __name__ == "__main__":
 		# get a single batch to:
 		# a) run through optimization to reload weights and optimizer variables,
 		# b) print layer dims
-		input_init, targets_init, _ = next(dds_train.as_numpy_iterator())
+		(input_init, targets_init,
+		    orig_mask_init, _, _) = next(dds_train.as_numpy_iterator())
 
 		if resume_from:
 			chief_print("\n______________________________ Resuming training from epoch {0} ______________________________".format(resume_from))
@@ -866,7 +845,8 @@ if __name__ == "__main__":
 			# This initializes the variables used by the optimizers,
 			# as well as any stateful metric variables
 			train_step_distrib(autoencoder, optimizer, loss_func,
-			                   input_init[0,:], targets_init[0,:])
+			                   input_init[0,:], targets_init[0,:],
+			                   orig_mask_init[0,:])
 			with strat.scope():
 				autoencoder.load_weights(weights_file_prefix)
 
@@ -903,11 +883,12 @@ if __name__ == "__main__":
 			losses_t_batches = []
 			losses_v_batches = []
 
-			for batch_input, batch_target, _, _ in dds_train:
+			for batch_input, batch_target, batch_orig_mask, _, _ in dds_train:
 				# TODO: replace with distributed train step! (all occurencies)
 				train_batch_loss = train_step_distrib(autoencoder,
 				                                      optimizer, loss_func,
-				                                      batch_input, batch_target)
+				                                      batch_input, batch_target,
+				                                      batch_orig_mask)
 				losses_t_batches.append(train_batch_loss)
 				step_counter += 1
 			train_loss_this_epoch = np.average(losses_t_batches)
@@ -939,12 +920,14 @@ if __name__ == "__main__":
 
 				startTime = datetime.now()
 
-				for batch_input_valid, batch_target_valid, _, _ in dds_valid:
+				for batch_input_valid, batch_target_valid,\
+				    batch_orig_mask, _, _ in dds_valid:
 					# TODO: implement this; don't forget training=False
 					valid_loss_batch = get_distrib_losses(autoencoder,
 					                                      loss_func,
 					                                      batch_input_valid,
-					                                      batch_target_valid)
+					                                      batch_target_valid,
+					                                      batch_orig_mask)
 					losses_v_batches.append(valid_loss_batch)
 				valid_loss_this_epoch = np.average(losses_v_batches)
 
@@ -1036,7 +1019,7 @@ if __name__ == "__main__":
 
 		dg_args = {"filebase"             : data_prefix,
 		           "global_batch_size"    : batch_size_project,
-		           "missing_mask"         : True,
+		           "missing_mask"         : missing_mask_input,
 		           "valid_split"          : 0.0,
 		           "impute_missing"       : fill_missing,
 		           "normalization_mode"   : norm_mode,
@@ -1085,18 +1068,20 @@ if __name__ == "__main__":
 			encoded_train = np.empty((0, n_latent_dim))
 			decoded_train = None
 			targets_train = np.empty((0, n_markers))
-			mask = np.empty((0, n_markers))
+			orig_mask_train = np.empty((0, n_markers))
 
 			loss_value_per_batch = []
 			genotype_conc_per_batch = []
 
-			for batch_input, batch_target, batch_indpop, _ in dds_proj:
+			for batch_input, batch_target,\
+			    batch_orig_mask, batch_indpop, _ in dds_proj:
 
 				# TODO: check how the mask dimension is handled here!
 				#       and wherever else dg batches are used
 				decoded_batch, encoded_batch = autoencoder(batch_input,
 				                                           is_training=False)
-				loss_batch  = loss_func(y_pred=decoded_batch, y_true=batch_target)
+				loss_batch  = loss_func(y_pred=decoded_batch, y_true=batch_target,
+				                        orig_nonmissing_mask=batch_orig_mask)
 				loss_batch += sum(autoencoder.losses)
 
 				ind_pop_list_train=np.concatenate((ind_pop_list_train, batch_indpop), axis=0)
@@ -1107,13 +1092,14 @@ if __name__ == "__main__":
 					decoded_train=np.concatenate((decoded_train, decoded_batch[:,0:n_markers]), axis=0)
 				targets_train=np.concatenate((targets_train, batch_target[:,0:n_markers]), axis=0)
 
-				mask = np.concatenate((mask, batch_input[:,:,1]), axis=0)
+				orig_mask_train = np.concatenate((orig_mask_train,
+				                                  batch_orig_mask), axis=0)
 
 				loss_value_per_batch.append(loss_batch)
 
 			ind_pop_list_train = np.array(ind_pop_list_train)
 			encoded_train = np.array(encoded_train)
-			mask = tf.cast(mask, tf.bool)
+			orig_mask_train = tf.cast(orig_mask_train, tf.bool)
 			loss_value = np.average(loss_value_per_batch)
 
 			if epoch == epochs[0]:
@@ -1127,12 +1113,6 @@ if __name__ == "__main__":
 
 			genotype_concordance_metric.reset_states()
 
-			# TODO: see get_originally_nonmissing_mask(), I wanna get rid of it.
-			#if not fill_missing:
-			#	orig_nonmissing_mask = get_originally_nonmissing_mask(targets_train)
-			#else:
-			#	orig_nonmissing_mask = np.full(targets_train.shape, True)
-
 			# TODO: maybe copy train_opts to project_opts in this mode or something. just for clarity.
 			if train_opts["loss"]["class"] == "MeanSquaredError" and (data_opts["norm_mode"] == "smartPCAstyle" or data_opts["norm_mode"] == "standard"):
 				try:
@@ -1144,27 +1124,21 @@ if __name__ == "__main__":
 
 				genotypes_output = to_genotypes_invscale_round(decoded_train[:, 0:n_markers], scaler_vals = scaler)
 				true_genotypes = to_genotypes_invscale_round(targets_train, scaler_vals = scaler)
-				#genotype_concordance_metric.update_state(y_pred = genotypes_output[orig_nonmissing_mask],
-				#                                         y_true = true_genotypes[orig_nonmissing_mask])
-				genotype_concordance_metric.update_state(y_pred = genotypes_output[mask],
-				                                         y_true = true_genotypes[mask])
+				genotype_concordance_metric.update_state(y_pred = genotypes_output[orig_mask_train],
+				                                         y_true = true_genotypes[orig_mask_train])
 
 
 			elif train_opts["loss"]["class"] == "BinaryCrossentropy" and data_opts["norm_mode"] == "genotypewise01":
 				genotypes_output = to_genotypes_sigmoid_round(decoded_train[:, 0:n_markers])
 				true_genotypes = targets_train
-				#genotype_concordance_metric.update_state(y_pred = genotypes_output[orig_nonmissing_mask],
-				#                                         y_true = true_genotypes[orig_nonmissing_mask])
-				genotype_concordance_metric.update_state(y_pred = genotypes_output[mask],
-				                                         y_true = true_genotypes[mask])
+				genotype_concordance_metric.update_state(y_pred = genotypes_output[orig_mask_train],
+				                                         y_true = true_genotypes[orig_mask_train])
 
 			elif train_opts["loss"]["class"] in ["CategoricalCrossentropy", "KLDivergence"] and data_opts["norm_mode"] == "genotypewise01":
 				genotypes_output = tf.cast(tf.argmax(alfreqvector(decoded_train[:, 0:n_markers]), axis = -1), tf.float16) * 0.5
 				true_genotypes = targets_train
-				#genotype_concordance_metric.update_state(y_pred = genotypes_output[orig_nonmissing_mask],
-				#                                         y_true = true_genotypes[orig_nonmissing_mask])
-				genotype_concordance_metric.update_state(y_pred = genotypes_output[mask],
-				                                         y_true = true_genotypes[mask])
+				genotype_concordance_metric.update_state(y_pred = genotypes_output[orig_mask_train],
+				                                         y_true = true_genotypes[orig_mask_train])
 
 			else:
 				chief_print("Could not calculate predicted genotypes and genotype concordance. Not implemented for loss {0} and normalization {1}.".format(train_opts["loss"]["class"], data_opts["norm_mode"]))

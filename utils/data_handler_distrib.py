@@ -475,6 +475,16 @@ class data_generator_distrib:
 
 		inputs = tf.identity(genos)
 		mask   = tf.cast(tf.fill(genos_shape, 1), tf.as_dtype(self.geno_dtype))
+		if self.impute_missing:
+			orig_mask = tf.identity(mask)
+		else:
+			where_nonmissing = tf.where(genos != self.missing_val)
+			delta_m = tf.repeat(1, tf.shape(where_nonmissing)[0])
+			delta_m = tf.sparse.SparseTensor(indices=where_nonmissing,
+			                                 values=delta_m,
+			                                 dense_shape=genos_shape)
+			delta_m = tf.sparse.to_dense(tf.cast(delta_m, mask.dtype))
+			orig_mask = delta_m
 
 		if sparsify:
 			probs = tf.random.uniform(shape=genos_shape, minval=0, maxval=1)
@@ -490,19 +500,15 @@ class data_generator_distrib:
 
 		if self.missing_mask:
 			if not self.impute_missing:
-				where_nonmissing = tf.where(genos != self.missing_val)
-				delta_m = tf.repeat(1, tf.shape(where_nonmissing)[0])
-				delta_m = tf.sparse.SparseTensor(indices=where_nonmissing,
-				                                 values=delta_m,
-				                                 dense_shape=genos_shape)
-				delta_m = tf.sparse.to_dense(tf.cast(delta_m, mask.dtype))
 				mask = tf.math.multiply(mask, delta_m)
 			inputs = tf.stack([inputs, mask], axis=-1)
 		else:
 			inputs = tf.expand_dims(inputs, axis=-1)
 
+		orig_mask = tf.cast(orig_mask, tf.bool)
+
 		# genos will serve as targets
-		return inputs, genos, indpop, *args
+		return inputs, genos, orig_mask, indpop, *args
 
 
 def get_most_common_genotypes(genos_):
