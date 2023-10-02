@@ -338,10 +338,9 @@ def run_optimization(model, optimizer, loss_function,
 	'''
 	with tf.GradientTape() as g:
 		output, encoded_data = model(input, is_training=True)
-		loss_value  = loss_function(y_pred = output, y_true = targets,
-		                            orig_nonmissing_mask = mask)
-		loss_value += tf.nn.scale_regularization_loss(sum(model.losses))
-		# TODO: ^ read more abt this function
+		loss_value = loss_function(y_pred = output, y_true = targets,
+		                           orig_nonmissing_mask = mask,
+		                           model_losses = model.losses)
 
 	gradients = g.gradient(loss_value, model.trainable_variables)
 
@@ -364,10 +363,21 @@ def train_step_distrib(model_, optimizer_, loss_function_,
 
 	return loss 
 
+@tf.function
+def compute_loss(model, loss_function, input, targets, mask):
+	output, _  = model(input, is_training=False)
+	loss_value = loss_function(y_pred = output, y_true = targets,
+	                           orig_nonmissing_mask = mask,
+	                           model_losses = model.losses)
+	return loss_value
 
-def get_distrib_losses(autoencoder, loss_func, inputs, targets):
-	# TODO
-	return 0.0
+@tf.function
+def compute_loss_distrib(model_, loss_function_, input_, targets_, mask_):
+	per_replica_losses = strat.run(compute_loss,
+	                               args=(model_, loss_function_,
+	                                     input_, targets_, mask_))
+	loss = strat.reduce("SUM", per_replica_losses, axis=None)
+	return loss
 
 
 def get_batches(n_samples, batch_size):
@@ -459,36 +469,40 @@ class LossContainer:
 			loss_args = loss_def_["args"]
 		else:
 			loss_args = dict()
-		self.loss_obj = loss_class(**loss_args)
+		loss_args["reduction"] = tf.keras.losses.Reduction.NONE
+		self.loss_object = loss_class(**loss_args)
 		if loss_class in (tf.keras.losses.CategoricalCrossentropy,
 		                  tf.keras.losses.KLDivergence):
-			self.wrapper = self.wrapper1
+			self.preproc = self.preproc1
 		else:
-			self.wrapper = self.wrapper2
+			self.preproc = self.preproc2
 		self.n_markers = n_markers_
 		self.fill_missing = fill_missing_
 
-	def wrapper1(self, y_pred, y_true, orig_nonmissing_mask):
+	def preproc1(self, y_pred, y_true):
 		y_pred = y_pred[:, 0:self.n_markers]
-
 		y_pred = alfreqvector(y_pred)
-		y_true = tf.one_hot(tf.cast(y_true * 2, tf.uint8), 3)*0.9997 + 0.0001
+		y_true = tf.one_hot(tf.cast(y_true*2, tf.uint8), 3)*0.9997 + 0.0001
+		return y_pred, y_true
 
-		if not self.fill_missing:
-			y_pred = y_pred[orig_nonmissing_mask]
-			y_true = y_true[orig_nonmissing_mask]
-
-		return self.loss_obj(y_pred=y_pred, y_true=y_true)
-
-	def wrapper2(self, y_pred, y_true, orig_nonmissing_mask):
+	def preproc2(self, y_pred, y_true):
 		y_pred = y_pred[:, 0:self.n_markers]
 		y_true = tf.convert_to_tensor(y_true)
+		return y_pred, y_true
+
+	def wrapper(self, y_pred, y_true, orig_nonmissing_mask, model_losses=None):
+		y_pred, y_true = self.preproc(y_pred, y_true)
 
 		if not self.fill_missing:
 			y_pred = y_pred[orig_nonmissing_mask]
 			y_true = y_true[orig_nonmissing_mask]
 
-		return self.loss_obj(y_pred=y_pred, y_true=y_true)
+		per_example_loss  = self.loss_object(y_pred=y_pred, y_true=y_true)
+		per_example_loss /= self.n_markers  # TODO: ask why
+		loss = tf.nn.compute_average_loss(per_example_loss)
+		if model_losses:
+			loss += tf.nn.scale_regularization_loss(sum(model_losses))
+		return loss
 
 
 if __name__ == "__main__":
@@ -521,7 +535,6 @@ if __name__ == "__main__":
 		num_workers, chief_id = set_tf_config()
 		isChief = os.environ["SLURMD_NODENAME"] == chief_id
 		os.environ["isChief"] = json.dumps(int(isChief))
-		# TODO: check if the chief gets correctly identified
 		chief_print("Number of workers: {}".format(num_workers))
 
 		if num_workers > 1 and arguments["train"]:
@@ -792,6 +805,8 @@ if __name__ == "__main__":
 		# TODO: double-check if these batch sizes are consistent with dg.
 		#       maybe we can even put get_batches() in there as a method.
 		#       google, how to get number of batches in a tf.data.Dataset obj?
+		# TODO: actually, since get_batches() is only used by the scheduler,
+		#       there should be an easy way to do without.
 		(n_train_batches,
 		 n_train_samples_last_batch) = get_batches(n_train_samples, batch_size)
 		(n_valid_batches,
@@ -849,9 +864,9 @@ if __name__ == "__main__":
 
 			# This initializes the variables used by the optimizers,
 			# as well as any stateful metric variables
-			train_step_distrib(autoencoder, optimizer, loss_obj.wrapper,
-			                   input_init[0,:], targets_init[0,:],
-			                   orig_mask_init[0,:])
+			_ = train_step_distrib(autoencoder, optimizer, loss_obj.wrapper,
+			                       input_init[0,:], targets_init[0,:],
+			                       orig_mask_init[0,:])
 			with strat.scope():
 				autoencoder.load_weights(weights_file_prefix)
 
@@ -889,7 +904,6 @@ if __name__ == "__main__":
 			losses_v_batches = []
 
 			for batch_input, batch_target, batch_orig_mask, _, _ in dds_train:
-				# TODO: replace with distributed train step! (all occurencies)
 				train_batch_loss = train_step_distrib(autoencoder,
 				                                      optimizer, loss_obj.wrapper,
 				                                      batch_input, batch_target,
@@ -925,12 +939,11 @@ if __name__ == "__main__":
 
 				for batch_input_valid, batch_target_valid,\
 				    batch_orig_mask, _, _ in dds_valid:
-					# TODO: implement this; don't forget training=False
-					valid_loss_batch = get_distrib_losses(autoencoder,
-					                                      loss_obj.wrapper,
-					                                      batch_input_valid,
-					                                      batch_target_valid,
-					                                      batch_orig_mask)
+					valid_loss_batch = compute_loss_distrib(autoencoder,
+					                                        loss_obj.wrapper,
+					                                        batch_input_valid,
+					                                        batch_target_valid,
+					                                        batch_orig_mask)
 					losses_v_batches.append(valid_loss_batch)
 				valid_loss_this_epoch = np.average(losses_v_batches)
 
@@ -960,7 +973,6 @@ if __name__ == "__main__":
 			if e % save_interval == 0 and e > start_saving_from :
 				ae_weight_manager.save(effective_epoch, autoencoder)
 
-		# TODO: remember to fix STRAT SCOPE
 		ae_weight_manager.save(effective_epoch, autoencoder)
 
 		if isChief:
@@ -996,6 +1008,7 @@ if __name__ == "__main__":
 		if not isChief:
 			print("Work has ended for this worker")
 			exit(0)
+		# TODO: implement multi-worker projecting someday
 
 		ae_weight_manager = WeightKeeper(train_directory)
 		projected_epochs = get_projected_epochs(encoded_data_file)
@@ -1067,13 +1080,15 @@ if __name__ == "__main__":
 
 			# TODO: find out if we should run 1-2 samples through optimization
 			#       in order to load the weights here.
-			autoencoder.load_weights(weights_file_prefix)
+			with strat.scope():
+				autoencoder.load_weights(weights_file_prefix)
 
 			ind_pop_list_train = np.empty(shape=(0,2), dtype=str)
 			encoded_train = np.empty((0, n_latent_dim))
 			decoded_train = None
 			targets_train = np.empty((0, n_markers))
 			orig_mask_train = np.empty((0, n_markers))
+			# TODO: all these arrays might outgrow RAM. do something.
 
 			loss_value_per_batch = []
 			genotype_conc_per_batch = []
@@ -1081,14 +1096,12 @@ if __name__ == "__main__":
 			for batch_input, batch_target,\
 			    batch_orig_mask, batch_indpop, _ in dds_proj:
 
-				# TODO: check how the mask dimension is handled here!
-				#       and wherever else dg batches are used
 				decoded_batch, encoded_batch = autoencoder(batch_input,
 				                                           is_training=False)
-				loss_batch  = loss_obj.wrapper(y_pred=decoded_batch,
-				                               y_true=batch_target,
-				                               orig_nonmissing_mask=batch_orig_mask)
-				loss_batch += sum(autoencoder.losses)
+				loss_batch = loss_obj.wrapper(y_pred=decoded_batch,
+				                              y_true=batch_target,
+				                              orig_nonmissing_mask=batch_orig_mask,
+				                              model_losses=autoencoder.losses)
 
 				ind_pop_list_train=np.concatenate((ind_pop_list_train, batch_indpop), axis=0)
 				encoded_train=np.concatenate((encoded_train, encoded_batch), axis=0)
