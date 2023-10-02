@@ -8,6 +8,7 @@ pandas-plink
 Pillow
 psutil
 pyarrow
+pytest-benchmark
 scikit-learn
 scipy
 seaborn
