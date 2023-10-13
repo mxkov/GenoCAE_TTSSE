@@ -82,15 +82,40 @@ def test_dataset_format():
 	from data_handler_distrib import data_generator_distrib
 	from tf_config import set_tf_config
 
-	num_workers, chief_id = set_tf_config()
-	strat = tfd.MirroredStrategy()
+	if "SLURMD_NODENAME" in os.environ:
+		num_workers, chief_id = set_tf_config()
+		resolver  = tfd.cluster_resolver.TFConfigClusterResolver()
+		comm_opts = tfde.CommunicationOptions(
+		                   implementation=tfde.CommunicationImplementation.NCCL)
+		# TODO: this doesn't work atm.
+		#       to try: tfde strat? comm other than NCCL?
+		strat = tfd.MultiWorkerMirroredStrategy(cluster_resolver=resolver,
+		                                        communication_options=comm_opts)
+	else:
+		num_workers = 1
+		chief_id = None
+		strat = tfd.MirroredStrategy()
 
 	num_devices = strat.num_replicas_in_sync
 
+	# TODO: make fixtures for diff param combinations
+	batch_size = 30
 	dg_args = {
-		# TODO
+		"filebase"             : "sometestdata", # TODO
+		"global_batch_size"    : batch_size * num_devices,
+		"tfrecords_prefix"     : "",
+		"missing_mask"         : True,
+		"valid_split"          : 0.2,
+		"impute_missing"       : False,
+		"normalization_mode"   : "genotypewise01",
+		"normalization_options": {"flip": False, "missing_val": -1.0},
+		"sparsifies"           : [0.0, 0.1, 0.2, 0.3, 0.4],
+		"pref_chunk_size"      : None,
+		"batch_shards"         : False,
+		"shuffle_dataset"      : True
 	}
 	dg = data_generator_distrib(**dg_args)
+	n_markers = dg.n_markers
 	
 	def make_dds(label):
 		dds = strat.distribute_datasets_from_function(
@@ -102,9 +127,9 @@ def test_dataset_format():
 	dds_valid = make_dds("valid")
 
 	(n_batches_train, batch_shapes_train,
-	 shape_mismatches_train) = analyze_dds(dds_train, num_devices)
+	 shape_mismatches_train) = analyze_dds(dds_train)
 	(n_batches_valid, batch_shapes_valid,
-	 shape_mismatches_valid) = analyze_dds(dds_valid, num_devices)
+	 shape_mismatches_valid) = analyze_dds(dds_valid)
 
 	# TODO: check shapes themselves
 	# TODO: check data types?
