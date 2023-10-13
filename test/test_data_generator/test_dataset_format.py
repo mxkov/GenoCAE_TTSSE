@@ -8,71 +8,85 @@ from tensorflow.types.experimental.distributed import PerReplica
 
 
 
-def analyze_dds(dds, stop_after=None):
-	N = 5  # how many elements are in each batch in dds
-	batch_shapes     = [None for i in range(N)]
-	shape_mismatches = [0 for i in range(N)]
-	n_chunks         = []
-	last_batch_shapes= []
+def analyze_dds(dds, dg, batch_size, stop_after=None):
 
+	n_markers  = dg.n_markers
+	last_dims  = 2 if dg.missing_mask else 1
+	geno_dtype = tf.as_dtype(dg.geno_dtype)
+
+	true_dtypes = [geno_dtype for i in range(3)] + [tf.string, tf.bool]
+
+	err_msg = None
 	batch_count = 0
+
+	element_names = ["inputs", "genos", "orig_mask",
+	                 "indpop", "last_batch_flag"]
 	for batch_inputs, batch_genos, batch_orig_mask, \
 	    batch_indpop, last_batch_in_chunk in dds:
-		# Each of these is a PerReplica, not a tensor
+		# Each of these elements is a PerReplica, not a tensor
 		# (unless there's only one device)
-		full_batch = [batch_inputs, batch_genos, batch_orig_mask,
-		              batch_indpop, last_batch_in_chunk]
 		many_replicas = type(batch_inputs)==PerReplica
 		if many_replicas:
-			full_batch = [x.values for x in full_batch]
-			# Now they are tuples of tensors
+			# Convert each element to a tuple of tensors
+			batch_inputs        = batch_inputs.values
+			batch_genos         = batch_genos.values
+			batch_orig_mask     = batch_orig_mask.values
+			batch_indpop        = batch_indpop.values
+			last_batch_in_chunk = last_batch_in_chunk.values
+		else:
+			# Wrap each element in a tuple of length 1
+			# (so we don't have to check many_replicas anymore)
+			batch_inputs        = (batch_inputs,)
+			batch_genos         = (batch_genos,)
+			batch_orig_mask     = (batch_orig_mask,)
+			batch_indpop        = (batch_indpop,)
+			last_batch_in_chunk = (last_batch_in_chunk,)
 		batch_count += 1
 
 		if batch_count == 1:
-			n_devices_cur_worker = len(full_batch[0]) if many_replicas else 1
-			n_chunks = [0 for j in range(n_devices_cur_worker)]
-			last_batch_shapes = [[] for j in range(n_devices_cur_worker)]
-			for i in range(N):
-				if many_replicas:
-					batch_shapes[i] = full_batch[i][0].shape
-				else:
-					batch_shapes[i] = full_batch[i].shape
+			n_devices_cur_worker = len(batch_inputs)
 
-		# If any replica has a last batch in chunk,
-		# record its shape and skip to the next batch
-		if many_replicas:
-			last_batch_where = [j for j in range(n_devices_cur_worker)
-			                    if last_batch_in_chunk.values[j]==True]
-			if len(last_batch_where) > 0:
-				for j_ in last_batch_where:
-					last_batch_shapes[j_].append([x[j_].shape
-					                              for x in full_batch])
-					n_chunks[j_] += 1
-				continue
-		else:
-			if last_batch_in_chunk:
-				last_batch_shapes[0] = [x.shape for x in full_batch]
-				n_chunks[0] += 1
-				continue
+		full_batch = [batch_inputs, batch_genos, batch_orig_mask,
+		              batch_indpop, last_batch_in_chunk]
 
-		for i in range(N):
-			if many_replicas:
-				cur_element_shape = full_batch[i][0].shape
-				# TODO: how to make these checks if not many_replicas?
-				assert len(full_batch[i]) == n_devices_cur_worker
-				for j in range(1,n_devices_cur_worker):
-					assert full_batch[i][j].shape == cur_element_shape
+		for i,element in enumerate(full_batch):
+			if len(element) != n_devices_cur_worker:
+				# Pretty sure it should NEVER happen, but just in case
+				err_msg = (f"Batch #{batch_count}: " +
+				           f"{element_names[i]} missing on some devices")
+				return err_msg
+
+		for j in range(n_devices_cur_worker):
+			if last_batch_in_chunk[j]:
+				cur_batch_size = batch_inputs[j].shape[0]
 			else:
-				cur_element_shape = full_batch[i].shape
-			if batch_shapes[i] != cur_element_shape:
-				shape_mismatches[i] += 1
-			# TODO: check these shapes in other ways (e.g. # of markers)
+				cur_batch_size = batch_size
+			true_shapes = [(cur_batch_size, n_markers, last_dims),
+			               (cur_batch_size, n_markers),
+			               (cur_batch_size, n_markers),
+			               (cur_batch_size, 2),
+			               (1,)]
+			for i,element in enumerate(full_batch):
+				cur_shape = element[j].shape
+				tru_shape = true_shapes[i]
+				if cur_shape != tru_shape:
+					err_msg = (f"Wrong {element_names[i]} shape " +
+					           f"in batch #{batch_count}: " +
+					           f"got {cur_shape}, expected {tru_shape}")
+					return err_msg
+				cur_dtype = element[j].dtype
+				tru_dtype = true_dtypes[i]
+				if cur_dtype != tru_dtype:
+					err_msg = (f"Wrong {element_names[i]} dtype " +
+					           f"in batch #{batch_count}: " +
+					           f"got {cur_dtype}, expected {tru_dtype}")
+					return err_msg
 
 		if stop_after is not None:
 			if batch_count >= stop_after:
 				break
 
-	return batch_count, batch_shapes, shape_mismatches
+	return err_msg
 
 
 def test_dataset_format():
@@ -115,7 +129,6 @@ def test_dataset_format():
 		"shuffle_dataset"      : True
 	}
 	dg = data_generator_distrib(**dg_args)
-	n_markers = dg.n_markers
 	
 	def make_dds(label):
 		dds = strat.distribute_datasets_from_function(
@@ -126,14 +139,13 @@ def test_dataset_format():
 	dds_train = make_dds("train")
 	dds_valid = make_dds("valid")
 
-	(n_batches_train, batch_shapes_train,
-	 shape_mismatches_train) = analyze_dds(dds_train)
-	(n_batches_valid, batch_shapes_valid,
-	 shape_mismatches_valid) = analyze_dds(dds_valid)
+	err_train = analyze_dds(dds_train, dg, batch_size)
+	err_valid = analyze_dds(dds_valid, dg, batch_size)
 
-	# TODO: check shapes themselves
-	# TODO: check data types?
-	shapes_match_train = all([x == 0 for x in shape_mismatches_train])
-	shapes_match_valid = all([x == 0 for x in shape_mismatches_valid])
-	reslist = [shapes_match_train, shapes_match_valid]
-	assert all(reslist)
+	full_err_msg = ""
+	if err_train is not None:
+		full_err_msg += f" In train: {err_train}."
+	if err_valid is not None:
+		full_err_msg += f" In valid: {err_valid}."
+
+	assert err_train is None and err_valid is None, full_err_msg
