@@ -39,6 +39,7 @@ import tensorflow as tf
 import tensorflow.distribute as tfd
 import tensorflow.distribute.experimental as tfde
 from tensorflow.keras import Model, layers
+from tensorflow.python.training.server_lib import ClusterSpec
 from datetime import datetime
 from utils.data_handler_distrib import data_generator_distrib # TODO: look into reimplementing all these below as well:
 from utils.data_handler import get_saved_epochs, get_projected_epochs, write_h5, read_h5, get_coords_by_pop, convex_hull_error, f1_score_kNN, plot_genotype_hist, to_genotypes_sigmoid_round, to_genotypes_invscale_round, GenotypeConcordance, get_pops_with_k, get_ind_pop_list_from_map, get_baseline_gc, write_metric_per_epoch_to_csv
@@ -73,6 +74,74 @@ def chief_print(msg):
 			print(msg)
 	else:
 		print(msg)
+
+
+class SlurmClusterResolver_fixed(tfd.cluster_resolver.SlurmClusterResolver):
+	"""Child of tf.distribute.cluster_resolver.SlurmClusterResolver
+	that does NOT assume GPU availablity."""
+
+	def cluster_spec(self):
+		"""Returns a ClusterSpec object based on the latest instance group info.
+
+		This returns a ClusterSpec object for use based on information from the
+		specified initialization parameters and Slurm environment variables. The
+		cluster specification is resolved each time this function is called. The
+		resolver extract hostnames of nodes by scontrol and pack tasks in that
+		order until a node a has number of tasks that is equal to specification.
+		GPUs on nodes are allocated to tasks by specification through setting
+		CUDA_VISIBLE_DEVICES environment variable.
+
+		Returns:
+		  A ClusterSpec containing host information retrieved from Slurm's
+		    environment variables.
+		"""
+
+		task_list = []
+		self._gpu_allocation = []
+		self._cluster_allocation = {}
+
+		# Sort to make sure the order is the same for each run
+		for host, num_tasks in sorted(self._task_configuration.items()):
+			# num_tasks is per node
+			if self._gpus_per_node == 0 or self._gpus_per_task == 0:
+				gpu_starting_ids_this_node = [None for _ in range(num_tasks)]
+			else:
+				gpu_starting_ids_this_node = range(0, self._gpus_per_node,
+				                                      self._gpus_per_task)
+
+			for port_offset, gpu_offset in zip(range(num_tasks),
+			                                   gpu_starting_ids_this_node):
+				host_addr = '%s:%d' % (host, self._port_base + port_offset)
+				task_list.append(host_addr)
+
+				if gpu_offset is None:
+					self._gpu_allocation.append('')
+					continue
+				gpu_id_list = []
+				for gpu_id in range(gpu_offset, gpu_offset+self._gpus_per_task):
+					gpu_id_list.append(str(gpu_id))
+				self._gpu_allocation.append(','.join(gpu_id_list))
+
+		cluster_rank_offset_start = 0
+		cluster_rank_offset_end = 0
+
+		# Sort to make sure the order is the same for each run
+		for task_type, num_tasks in sorted(self._jobs.items()):
+			cluster_rank_offset_end = cluster_rank_offset_start + num_tasks
+
+			self._cluster_allocation[task_type] = (
+			       task_list[cluster_rank_offset_start:cluster_rank_offset_end])
+
+			if cluster_rank_offset_start <= self._rank < cluster_rank_offset_end:
+				self.task_type = task_type
+				self.task_id = self._rank - cluster_rank_offset_start
+
+			cluster_rank_offset_start = cluster_rank_offset_end
+
+		if self._auto_set_gpu:
+			os.environ['CUDA_VISIBLE_DEVICES']=self._gpu_allocation[self._rank]
+
+		return ClusterSpec(self._cluster_allocation)
 
 
 GCAE_DIR = Path(__file__).resolve().parent
@@ -490,16 +559,21 @@ if __name__ == "__main__":
 	if "SLURMD_NODENAME" in os.environ:
 
 		slurm_job = 1
-		#addresses, chief, num_workers = set_tf_config()
 		num_workers, chief_id = set_tf_config()
 		isChief = os.environ["SLURMD_NODENAME"] == chief_id
 		os.environ["isChief"] = json.dumps(int(isChief))
 		chief_print("Number of workers: {}".format(num_workers))
 
 		if num_workers > 1 and arguments["train"]:
-			# Don't use SlurmClusterResolver: we don't always run this on an HPC cluster
-			resolver = tfd.cluster_resolver.TFConfigClusterResolver()
-			comm_opts = tfde.CommunicationOptions(implementation = tfde.CommunicationImplementation.NCCL)
+			#resolver = tfd.cluster_resolver.TFConfigClusterResolver()
+			resolver=SlurmClusterResolver_fixed(gpus_per_node=num_physical_gpus)
+			if num_physical_gpus > 0:
+				comm_impl = tfde.CommunicationImplementation.NCCL
+				os.environ["NCCL_DEBUG"] = "INFO" # or "WARN"
+			else:
+				comm_impl = tfde.CommunicationImplementation.RING
+			#comm_impl = tfde.CommunicationImplementation.AUTO
+			comm_opts = tfde.CommunicationOptions(implementation = comm_impl)
 			# CollectiveCommunication is deprecated in TF 2.7
 			strat = tfd.MultiWorkerMirroredStrategy(cluster_resolver = resolver,
 			                                        communication_options = comm_opts)
@@ -509,6 +583,7 @@ if __name__ == "__main__":
 				print("Work has ended for this worker")
 				exit(0)
 			slurm_job = 0
+			# TODO: make it not nccl when no gpus?
 			strat = tfd.MirroredStrategy(devices = gpus,
 			                             cross_device_ops = tfd.NcclAllReduce())
 
