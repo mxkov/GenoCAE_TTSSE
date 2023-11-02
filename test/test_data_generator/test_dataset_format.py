@@ -89,7 +89,11 @@ def analyze_dds(dds, dg, batch_size, stop_after=None):
 	return err_msg
 
 
-def test_dataset_format():
+def test_dataset_format(f_filebase,
+                        f_batch_size, f_missing_mask, f_valid_split,
+                        f_impute_missing, f_sparsifies,
+                        f_norm_opts_flip, f_norm_opts_missval,
+                        f_pref_chunk_size, f_shuffle_dataset):
 
 	GCAE_DIR = pathlib.Path(__file__).resolve().parents[1]
 	sys.path.append(os.path.join(GCAE_DIR, 'utils'))
@@ -111,36 +115,34 @@ def test_dataset_format():
 		strat = tfd.MirroredStrategy()
 
 	num_devices = strat.num_replicas_in_sync
+	perreplica_batch_size = f_batch_size // num_devices
 
-	# TODO: make fixtures for diff param combinations
-	batch_size = 30
 	dg_args = {
-		"filebase"             : "sometestdata", # TODO
-		"global_batch_size"    : batch_size * num_devices,
-		"tfrecords_prefix"     : "",
-		"missing_mask"         : True,
-		"valid_split"          : 0.2,
-		"impute_missing"       : False,
+		"filebase"             : f_filebase,
+		"global_batch_size"    : f_batch_size,
+		"missing_mask"         : f_missing_mask,
+		"valid_split"          : f_valid_split,
+		"impute_missing"       : f_impute_missing,
+		"sparsifies"           : f_sparsifies,
 		"normalization_mode"   : "genotypewise01",
-		"normalization_options": {"flip": False, "missing_val": -1.0},
-		"sparsifies"           : [0.0, 0.1, 0.2, 0.3, 0.4],
-		"pref_chunk_size"      : None,
+		"normalization_options": {"flip"       : f_norm_opts_flip,
+		                          "missing_val": f_norm_opts_missval},
+		"pref_chunk_size"      : f_pref_chunk_size,
 		"batch_shards"         : False,
-		"shuffle_dataset"      : True
+		"shuffle_dataset"      : f_shuffle_dataset
 	}
 	dg = data_generator_distrib(**dg_args)
 	
 	def make_dds(label):
 		dds = strat.distribute_datasets_from_function(
 		              lambda x: dg.create_dataset_from_pq(x, split=label))
-		#n_batches = get_dds_size(dds) # <- takes forever
 		return dds
 
 	dds_train = make_dds("train")
 	dds_valid = make_dds("valid")
 
-	err_train = analyze_dds(dds_train, dg, batch_size)
-	err_valid = analyze_dds(dds_valid, dg, batch_size)
+	err_train = analyze_dds(dds_train, dg, perreplica_batch_size)
+	err_valid = analyze_dds(dds_valid, dg, perreplica_batch_size)
 
 	full_err_msg = ""
 	if err_train is not None:
