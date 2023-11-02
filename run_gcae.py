@@ -60,6 +60,7 @@ import h5py
 import matplotlib.animation as animation
 from pathlib import Path
 
+# TODO: add PerReplica checks!!!
 
 def isChief():
 	if "isChief" in os.environ:
@@ -461,49 +462,6 @@ class WeightKeeper:
 			shutil.rmtree(self.weights_dir)
 
 
-class LossContainer:
-
-	def __init__(self, loss_def_, n_markers_, fill_missing_):
-		loss_class = getattr(eval(loss_def_["module"]), loss_def_["class"])
-		if "args" in loss_def_.keys():
-			loss_args = loss_def_["args"]
-		else:
-			loss_args = dict()
-		loss_args["reduction"] = tf.keras.losses.Reduction.NONE
-		self.loss_object = loss_class(**loss_args)
-		if loss_class in (tf.keras.losses.CategoricalCrossentropy,
-		                  tf.keras.losses.KLDivergence):
-			self.preproc = self.preproc1
-		else:
-			self.preproc = self.preproc2
-		self.n_markers = n_markers_
-		self.fill_missing = fill_missing_
-
-	def preproc1(self, y_pred, y_true):
-		y_pred = y_pred[:, 0:self.n_markers]
-		y_pred = alfreqvector(y_pred)
-		y_true = tf.one_hot(tf.cast(y_true*2, tf.uint8), 3)*0.9997 + 0.0001
-		return y_pred, y_true
-
-	def preproc2(self, y_pred, y_true):
-		y_pred = y_pred[:, 0:self.n_markers]
-		y_true = tf.convert_to_tensor(y_true)
-		return y_pred, y_true
-
-	def wrapper(self, y_pred, y_true, orig_nonmissing_mask, model_losses=None):
-		y_pred, y_true = self.preproc(y_pred, y_true)
-
-		if not self.fill_missing:
-			y_pred = y_pred[orig_nonmissing_mask]
-			y_true = y_true[orig_nonmissing_mask]
-
-		per_example_loss  = self.loss_object(y_pred=y_pred, y_true=y_true)
-		per_example_loss /= self.n_markers  # TODO: ask why
-		loss = tf.nn.compute_average_loss(per_example_loss)
-		if model_losses:
-			loss += tf.nn.scale_regularization_loss(sum(model_losses))
-		return loss
-
 
 if __name__ == "__main__":
 	chief_print("tensorflow version {0}".format(tf.__version__))
@@ -733,6 +691,12 @@ if __name__ == "__main__":
 
 		loss_def = train_opts["loss"]
 
+		loss_class = getattr(eval(loss_def["module"]), loss_def["class"])
+		if "args" in loss_def.keys():
+			loss_args = loss_def["args"]
+		else:
+			loss_args = dict()
+		loss_args["reduction"] = tf.keras.losses.Reduction.NONE
 
 	if arguments['train']:
 
@@ -807,6 +771,7 @@ if __name__ == "__main__":
 		#       google, how to get number of batches in a tf.data.Dataset obj?
 		# TODO: actually, since get_batches() is only used by the scheduler,
 		#       there should be an easy way to do without.
+		#       for example, save batch count to wherever we're resuming from.
 		(n_train_batches,
 		 n_train_samples_last_batch) = get_batches(n_train_samples, batch_size)
 		(n_valid_batches,
@@ -848,7 +813,29 @@ if __name__ == "__main__":
 			autoencoder = Autoencoder(model_architecture, n_markers,
 			                          noise_std, regularizer)
 			optimizer = tf.optimizers.Adam(learning_rate = lr_schedule)
-			loss_obj = LossContainer(loss_def, n_markers, fill_missing)
+			loss_obj = loss_class(**loss_args)
+
+			@tf.function
+			def loss_func(y_pred, y_true, orig_nonmissing_mask, model_losses):
+				y_pred = y_pred[:, 0:n_markers]
+				y_pred = alfreqvector(y_pred)
+				y_true = tf.one_hot(tf.cast(y_true*2, tf.uint8), 3)*0.9997 + 0.0001
+				
+				if not fill_missing and y_pred.shape[0] != 0:
+				# The shape check is a crutch for empty batches:
+				# if one of the replicas receives a batch with 0 samples,
+				# the mask will have shape (0,0) not matching y_pred and y_true.
+				# TODO: handle this better.
+				# empty batches STILL produce errors in other places,
+				# e.g. PredictLoss(). Handle them BEFORE they get there.
+					y_pred = y_pred[orig_nonmissing_mask]
+					y_true = y_true[orig_nonmissing_mask]
+				
+				per_example_loss  = loss_obj(y_pred=y_pred, y_true=y_true)
+				#per_example_loss /= self.n_markers  # TODO: ask why
+				loss = tf.nn.compute_average_loss(per_example_loss)
+				loss += tf.nn.scale_regularization_loss(sum(model_losses))
+				return loss
 
 		# get a single batch to:
 		# a) run through optimization to reload weights and optimizer variables,
@@ -864,7 +851,7 @@ if __name__ == "__main__":
 
 			# This initializes the variables used by the optimizers,
 			# as well as any stateful metric variables
-			_ = train_step_distrib(autoencoder, optimizer, loss_obj.wrapper,
+			_ = train_step_distrib(autoencoder, optimizer, loss_func,
 			                       input_init[0,:], targets_init[0,:],
 			                       orig_mask_init[0,:])
 			with strat.scope():
@@ -905,7 +892,7 @@ if __name__ == "__main__":
 
 			for batch_input, batch_target, batch_orig_mask, _, _ in dds_train:
 				train_batch_loss = train_step_distrib(autoencoder,
-				                                      optimizer, loss_obj.wrapper,
+				                                      optimizer, loss_func,
 				                                      batch_input, batch_target,
 				                                      batch_orig_mask)
 				losses_t_batches.append(train_batch_loss)
@@ -940,7 +927,7 @@ if __name__ == "__main__":
 				for batch_input_valid, batch_target_valid,\
 				    batch_orig_mask, _, _ in dds_valid:
 					valid_loss_batch = compute_loss_distrib(autoencoder,
-					                                        loss_obj.wrapper,
+					                                        loss_func,
 					                                        batch_input_valid,
 					                                        batch_target_valid,
 					                                        batch_orig_mask)
@@ -1059,8 +1046,24 @@ if __name__ == "__main__":
 		with strat.scope():
 			autoencoder = Autoencoder(model_architecture, n_markers,
 			                          noise_std, regularizer)
-			loss_obj = LossContainer(loss_def, n_markers, fill_missing)
+			loss_obj = loss_class(**loss_args)
 			genotype_concordance_metric = GenotypeConcordance()
+
+			@tf.function
+			def loss_func(y_pred, y_true, orig_nonmissing_mask, model_losses):
+				y_pred = y_pred[:, 0:n_markers]
+				y_pred = alfreqvector(y_pred)
+				y_true = tf.one_hot(tf.cast(y_true*2, tf.uint8), 3)*0.9997 + 0.0001
+				
+				if not fill_missing:
+					y_pred = y_pred[orig_nonmissing_mask]
+					y_true = y_true[orig_nonmissing_mask]
+				
+				per_example_loss  = loss_obj(y_pred=y_pred, y_true=y_true)
+				#per_example_loss /= self.n_markers  # TODO: ask why
+				loss = tf.nn.compute_average_loss(per_example_loss)
+				loss += tf.nn.scale_regularization_loss(sum(model_losses))
+				return loss
 
 		# loss function of the train set per epoch
 		losses_train = []
@@ -1098,10 +1101,10 @@ if __name__ == "__main__":
 
 				decoded_batch, encoded_batch = autoencoder(batch_input,
 				                                           is_training=False)
-				loss_batch = loss_obj.wrapper(y_pred=decoded_batch,
-				                              y_true=batch_target,
-				                              orig_nonmissing_mask=batch_orig_mask,
-				                              model_losses=autoencoder.losses)
+				loss_batch = loss_func(y_pred=decoded_batch,
+				                       y_true=batch_target,
+				                       orig_nonmissing_mask=batch_orig_mask,
+				                       model_losses=autoencoder.losses)
 
 				ind_pop_list_train=np.concatenate((ind_pop_list_train, batch_indpop), axis=0)
 				encoded_train=np.concatenate((encoded_train, encoded_batch), axis=0)
