@@ -62,7 +62,7 @@ from pathlib import Path
 
 # TODO: add PerReplica checks!!!
 
-def isChief():
+def _isChief():
 	if "isChief" in os.environ:
 		return os.environ["isChief"] == "1"
 	return True
@@ -419,7 +419,7 @@ class WeightKeeper:
 
 	def __init__(self, train_directory, default_prefix=""):
 		chief_weights_dirname = "weights"
-		if isChief():
+		if _isChief():
 			weights_dirname = chief_weights_dirname
 		else:
 			weights_dirname = "weights_tmp_" + os.environ["SLURMD_NODENAME"]
@@ -457,7 +457,7 @@ class WeightKeeper:
 		            f"time: {save_time}")
 
 	def cleanup(self):
-		if not isChief():
+		if not _isChief():
 			assert self.weights_dir != self.weights_dir_chief
 			shutil.rmtree(self.weights_dir)
 
@@ -841,7 +841,12 @@ if __name__ == "__main__":
 		# a) run through optimization to reload weights and optimizer variables,
 		# b) print layer dims
 		(input_init, targets_init,
-		    orig_mask_init, _, _) = next(dds_train.as_numpy_iterator())
+		    orig_mask_init, _, _) = next(iter(dds_train))
+		# get the same for every device
+		if num_devices > 1:
+			input_init     = input_init.values[0]
+			targets_init   = targets_init.values[0]
+			orig_mask_init = orig_mask_init.values[0]
 
 		if resume_from:
 			chief_print("\n______________________________ Resuming training from epoch {0} ______________________________".format(resume_from))
@@ -862,7 +867,8 @@ if __name__ == "__main__":
 		# a small run-through of the model with just 2 samples for printing the dimensions of the layers (verbose=True)
 		chief_print("Model layers and dimensions:")
 		chief_print("-----------------------------")
-		_, _ = autoencoder(input_init[:2,:], is_training=False, verbose=True)
+		with strat.scope():
+			_, _ = autoencoder(input_init[:2,:], is_training=False, verbose=True)
 
 		######### Create objects for tensorboard summary ###############################
 
@@ -948,7 +954,7 @@ if __name__ == "__main__":
 					min_valid_loss_epoch = effective_epoch
 
 					if e > start_saving_from:
-						ae_weight_manager.save(effective_epoch, autoencoder,
+						ae_weight_manager.save(autoencoder, effective_epoch,
 						                       update_best=True)
 
 				evals_since_min_valid_loss = effective_epoch - min_valid_loss_epoch
@@ -958,9 +964,9 @@ if __name__ == "__main__":
 					break
 
 			if e % save_interval == 0 and e > start_saving_from :
-				ae_weight_manager.save(effective_epoch, autoencoder)
+				ae_weight_manager.save(autoencoder, effective_epoch)
 
-		ae_weight_manager.save(effective_epoch, autoencoder)
+		ae_weight_manager.save(autoencoder, effective_epoch)
 
 		if isChief:
 			outfilename = os.path.join(train_directory, "train_times.csv")
@@ -1017,7 +1023,7 @@ if __name__ == "__main__":
 		chief_print("Projecting epochs: {0}".format(epochs))
 		chief_print("Already projected: {0}".format(projected_epochs))
 
-		batch_size_project = global_batch_size
+		batch_size_project = batch_size
 		sparsify_fraction = 0.0
 
 		dg_args = {"filebase"             : data_prefix,
@@ -1043,11 +1049,11 @@ if __name__ == "__main__":
 		# TODO: actually we do need the strat.
 		#       so we can properly finalize the dataset.
 		#       that was avoidable, but whoops, too late.
+		genotype_concordance_metric = GenotypeConcordance()
 		with strat.scope():
 			autoencoder = Autoencoder(model_architecture, n_markers,
 			                          noise_std, regularizer)
 			loss_obj = loss_class(**loss_args)
-			genotype_concordance_metric = GenotypeConcordance()
 
 			@tf.function
 			def loss_func(y_pred, y_true, orig_nonmissing_mask, model_losses):
