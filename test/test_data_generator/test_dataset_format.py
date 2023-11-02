@@ -4,8 +4,7 @@ import sys
 import tensorflow as tf
 import tensorflow.distribute as tfd
 import tensorflow.distribute.experimental as tfde
-from tensorflow.types.experimental.distributed import PerReplica
-
+from tensorflow.python.distribute.values import PerReplica
 
 
 def analyze_dds(dds, dg, batch_size, stop_after=None):
@@ -14,13 +13,13 @@ def analyze_dds(dds, dg, batch_size, stop_after=None):
 	last_dims  = 2 if dg.missing_mask else 1
 	geno_dtype = tf.as_dtype(dg.geno_dtype)
 
-	true_dtypes = [geno_dtype for i in range(3)] + [tf.string, tf.bool]
-
+	element_names = ["inputs", "genos", "orig_mask",
+	                 "indpop", "last_batch_flag"]
+	true_dtypes   = [geno_dtype, geno_dtype, tf.bool,
+	                 tf.string, tf.bool]
 	err_msg = None
 	batch_count = 0
 
-	element_names = ["inputs", "genos", "orig_mask",
-	                 "indpop", "last_batch_flag"]
 	for batch_inputs, batch_genos, batch_orig_mask, \
 	    batch_indpop, last_batch_in_chunk in dds:
 		# Each of these elements is a PerReplica, not a tensor
@@ -61,11 +60,11 @@ def analyze_dds(dds, dg, batch_size, stop_after=None):
 				cur_batch_size = batch_inputs[j].shape[0]
 			else:
 				cur_batch_size = batch_size
-			true_shapes = [(cur_batch_size, n_markers, last_dims),
-			               (cur_batch_size, n_markers),
-			               (cur_batch_size, n_markers),
-			               (cur_batch_size, 2),
-			               (1,)]
+			true_shapes = [(cur_batch_size, n_markers, last_dims), # inputs
+			               (cur_batch_size, n_markers),            # genos
+			               (cur_batch_size, n_markers),            # orig. mask
+			               (cur_batch_size, 2),                    # indpop
+			               (1,)]                                   # last batch
 			for i,element in enumerate(full_batch):
 				cur_shape = element[j].shape
 				tru_shape = true_shapes[i]
@@ -95,23 +94,29 @@ def test_dataset_format(f_filebase,
                         f_norm_opts_flip, f_norm_opts_missval,
                         f_pref_chunk_size, f_shuffle_dataset):
 
-	GCAE_DIR = pathlib.Path(__file__).resolve().parents[1]
+	GCAE_DIR = pathlib.Path(__file__).resolve().parents[2]
+	sys.path.append(str(GCAE_DIR)) # squash this into the latest commit
+	from run_gcae import SlurmClusterResolver_fixed
 	sys.path.append(os.path.join(GCAE_DIR, 'utils'))
 	from data_handler_distrib import data_generator_distrib
 	from tf_config import set_tf_config
 
+	gpus = tf.config.list_physical_devices(device_type="GPU")
+	num_physical_gpus = len(gpus)
+
 	if "SLURMD_NODENAME" in os.environ:
-		num_workers, chief_id = set_tf_config()
-		resolver  = tfd.cluster_resolver.TFConfigClusterResolver()
-		comm_opts = tfde.CommunicationOptions(
-		                   implementation=tfde.CommunicationImplementation.NCCL)
-		# TODO: this doesn't work atm.
-		#       to try: tfde strat? comm other than NCCL?
+		#num_workers, _ = set_tf_config()
+		#resolver  = tfd.cluster_resolver.TFConfigClusterResolver()
+		resolver = SlurmClusterResolver_fixed(gpus_per_node=num_physical_gpus)
+		if num_physical_gpus > 0:
+			comm_impl = tfde.CommunicationImplementation.NCCL
+		else:
+			comm_impl = tfde.CommunicationImplementation.RING
+		comm_opts = tfde.CommunicationOptions(implementation = comm_impl)
 		strat = tfd.MultiWorkerMirroredStrategy(cluster_resolver=resolver,
 		                                        communication_options=comm_opts)
 	else:
-		num_workers = 1
-		chief_id = None
+		#num_workers = 1
 		strat = tfd.MirroredStrategy()
 
 	num_devices = strat.num_replicas_in_sync
@@ -132,7 +137,11 @@ def test_dataset_format(f_filebase,
 		"shuffle_dataset"      : f_shuffle_dataset
 	}
 	dg = data_generator_distrib(**dg_args)
-	
+
+	#batch_size_per_replica = 1
+	#total_batches = dg.n_total_samples // batch_size_per_replica
+	# we get empty batches if total_batches % num_devices != 0
+
 	def make_dds(label):
 		dds = strat.distribute_datasets_from_function(
 		              lambda x: dg.create_dataset_from_pq(x, split=label))
