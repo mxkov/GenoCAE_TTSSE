@@ -5,6 +5,7 @@ import os
 import pathlib
 from psutil import virtual_memory
 import pyarrow.parquet as pq
+import re
 import scipy
 import tensorflow as tf
 
@@ -64,12 +65,27 @@ class data_generator_distrib:
 
 		self.ind_pop_list = np.empty(shape=(0,2), dtype=str)
 		fam_files = sorted(glob.glob(self.filebase+"*.fam"))
-		for file in fam_files:
-			indpop = np.genfromtxt(file, dtype=str)
+		if len(fam_files) == 0:
+			raise FileNotFoundError("No FAM files found that fit " +
+			                       f"the pattern {self.filebase}*.fam")
+
+		for fam_file in fam_files:
+			pq_file = re.sub(".fam$", ".parquet", fam_file)
+			if not os.path.isfile(pq_file):
+				raise FileNotFoundError(f"FAM File {fam_file} " +
+				                         "does not have a corresponding " +
+				                        f"Parquet file {pq_file}")
+
+			indpop = np.genfromtxt(fam_file, dtype=str)
 			if dropdata:
 				indpop = drop_inds(indpop)
 			indpop = indpop[:,[1,0]]
 			self.ind_pop_list=np.concatenate((self.ind_pop_list,indpop), axis=0)
+
+			self.samples_per_file[pq_file] = indpop.shape[0]
+
+		if self.ind_pop_list.shape[0] == 0:
+			raise IOError(f"No samples found in FAM files {self.filebase}*.fam")
 
 
 	def _get_n_markers(self):
@@ -77,6 +93,8 @@ class data_generator_distrib:
 		bim_files = sorted(glob.glob(self.filebase+"*.bim"))
 		for file in bim_files:
 			self.n_markers += len(np.genfromtxt(file, usecols=(1), dtype=str))
+		if self.n_markers <= 0:
+			raise IOError(f"No markers found in BIM files {self.filebase}*.bim")
 
 	def _define_samples(self):
 		self.n_total_samples = len(self.ind_pop_list)
@@ -167,6 +185,9 @@ class data_generator_distrib:
 		batch_size  = input_context.get_per_replica_batch_size(self.global_batch_size)
 
 		pq_paths = sorted(glob.glob(self.filebase+"*.parquet"))
+		if len(pq_paths) % num_workers != 0:
+			raise RuntimeError(f"Can't distribute {len(pq_paths)} input files" +
+			                   f" evenly between {num_workers} workers")
 
 		ds = tf.data.Dataset.from_tensor_slices(pq_paths)
 		ds = ds.shard(num_workers, worker_id)
