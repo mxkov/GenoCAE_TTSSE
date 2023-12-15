@@ -558,6 +558,11 @@ if __name__ == "__main__":
 
 	## Define distribution strategies
 
+	if "CLUSTER" in os.environ:
+		cluster_name = os.environ["CLUSTER"]
+	else:
+		cluster_name = "local"
+
 	if "SLURMD_NODENAME" in os.environ:
 
 		slurm_job = 1
@@ -568,10 +573,15 @@ if __name__ == "__main__":
 
 		if num_workers > 1 and arguments["train"]:
 			#resolver = tfd.cluster_resolver.TFConfigClusterResolver()
+			# TODO: how about you move this whole cluster setup to another module
 			resolver=SlurmClusterResolver_fixed(gpus_per_node=num_physical_gpus)
 			if num_physical_gpus > 0:
 				comm_impl = tfde.CommunicationImplementation.NCCL
 				os.environ["NCCL_DEBUG"] = "INFO" # or "WARN"
+				if cluster_name == "bianca":
+					os.environ["NCCL_SOCKET_IFNAME"] = "=eth1"
+					os.environ["NCCL_P2P_DISABLE"] = "0"
+					os.environ["NCCL_P2P_LEVEL"] = "NVL"
 			else:
 				comm_impl = tfde.CommunicationImplementation.RING
 			#comm_impl = tfde.CommunicationImplementation.AUTO
