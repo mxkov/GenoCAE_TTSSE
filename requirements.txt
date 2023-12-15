@@ -14,4 +14,3 @@ scipy
 seaborn
 setuptools
 tabulate
-tensorflow>=2.13.0
