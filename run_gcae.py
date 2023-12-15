@@ -68,7 +68,7 @@ def _isChief():
 		return os.environ["isChief"] == "1"
 	return True
 
-def chief_print(msg):
+def chief_print1(msg):
 	if "isChief" in os.environ:
 		if os.environ["isChief"] == "1":
 			print(msg)
@@ -534,6 +534,8 @@ class WeightKeeper:
 
 
 if __name__ == "__main__":
+	chief_print = print
+	chief_print(f"\n{datetime.now().time()}\n")
 	chief_print("tensorflow version {0}".format(tf.__version__))
 	tf.keras.backend.set_floatx('float32')
 
@@ -664,10 +666,14 @@ if __name__ == "__main__":
 
 	batch_size = train_opts["batch_size"]
 	global_batch_size = train_opts["batch_size"] * num_devices
-	# TODO: careful with this ^ when you e.g. project, bc you retire all non-chief workers then
 	learning_rate = train_opts["learning_rate"] * num_devices
 	# TODO: ^ check this later
 	regularizer = train_opts["regularizer"]
+
+	try:
+		max_batches = int(train_opts["max_batches"])
+	except:
+		max_batches = None
 
 	superpopulations_file = arguments['superpops']
 	if superpopulations_file and not os.path.isabs(os.path.dirname(superpopulations_file)):
@@ -825,6 +831,7 @@ if __name__ == "__main__":
 		# TODO: right now, valid set is defined in this method.
 		#       if it gets moved to init or outer scope, we can call these later,
 		#       after setting up lr schedule and such.
+		chief_print(f"Data chunk size: {dg.pref_chunk_size}")
 
 		n_unique_train_samples = copy.deepcopy(dg.n_train_samples)
 		n_valid_samples = copy.deepcopy(dg.n_valid_samples)
@@ -900,13 +907,14 @@ if __name__ == "__main__":
 				y_pred = alfreqvector(y_pred)
 				y_true = tf.one_hot(tf.cast(y_true*2, tf.uint8), 3)*0.9997 + 0.0001
 				
-				if not fill_missing and y_pred.shape[0] != 0:
+				#if not fill_missing and y_pred.shape[0] != 0:
 				# The shape check is a crutch for empty batches:
 				# if one of the replicas receives a batch with 0 samples,
 				# the mask will have shape (0,0) not matching y_pred and y_true.
 				# TODO: handle this better.
 				# empty batches STILL produce errors in other places,
 				# e.g. PredictLoss(). Handle them BEFORE they get there.
+				if not fill_missing:
 					y_pred = y_pred[orig_nonmissing_mask]
 					y_true = y_true[orig_nonmissing_mask]
 				
@@ -922,7 +930,7 @@ if __name__ == "__main__":
 		(input_init, targets_init,
 		    orig_mask_init, _, _) = next(iter(dds_train))
 		# get the same for every device
-		if num_devices > 1:
+		if num_devices > 1: # TODO: replace with PerReplica check
 			input_init     = input_init.values[0]
 			targets_init   = targets_init.values[0]
 			orig_mask_init = orig_mask_init.values[0]
@@ -967,6 +975,8 @@ if __name__ == "__main__":
 		min_valid_loss = np.inf
 		min_valid_loss_epoch = None
 
+		chief_print(f"\nTraining start: {datetime.now().time()}")
+
 		for e in range(1,epochs+1):
 			# TODO: profiler, mayhaps?
 			#       https://www.tensorflow.org/guide/profiler
@@ -974,6 +984,8 @@ if __name__ == "__main__":
 			effective_epoch = e + resume_from
 			losses_t_batches = []
 			losses_v_batches = []
+			batch_count_train = 0
+			batch_count_valid = 0
 
 			for batch_input, batch_target, batch_orig_mask, _, _ in dds_train:
 				train_batch_loss = train_step_distrib(autoencoder,
@@ -982,6 +994,9 @@ if __name__ == "__main__":
 				                                      batch_orig_mask)
 				losses_t_batches.append(train_batch_loss)
 				step_counter += 1
+				batch_count_train += 1
+				if max_batches is not None and batch_count_train > max_batches:
+					break
 			train_loss_this_epoch = np.average(losses_t_batches)
 
 			train_time = (datetime.now() - startTime).total_seconds()
@@ -1003,7 +1018,8 @@ if __name__ == "__main__":
 
 			chief_print("")
 			chief_print("Epoch: {}/{}...".format(effective_epoch, epochs+resume_from))
-			chief_print("--- Train loss: {:.4f}  time: {}".format(train_loss_this_epoch, train_time))
+			chief_print("--- Train loss: {:.4f}  time: {} ({})".format(
+			          train_loss_this_epoch, train_time, datetime.now().time()))
 
 			if n_valid_samples > 0:
 
@@ -1017,6 +1033,9 @@ if __name__ == "__main__":
 					                                        batch_target_valid,
 					                                        batch_orig_mask)
 					losses_v_batches.append(valid_loss_batch)
+					batch_count_valid += 1
+					if max_batches is not None and batch_count_valid > max_batches:
+						break
 				valid_loss_this_epoch = np.average(losses_v_batches)
 
 				valid_time = (datetime.now() - startTime).total_seconds()
@@ -1037,7 +1056,9 @@ if __name__ == "__main__":
 						                       update_best=True)
 
 				evals_since_min_valid_loss = effective_epoch - min_valid_loss_epoch
-				chief_print("--- Valid loss: {:.4f}  time: {} min loss: {:.4f} epochs since: {}".format(valid_loss_this_epoch, valid_time, min_valid_loss, evals_since_min_valid_loss))
+				chief_print("--- Valid loss: {:.4f}  time: {} ({}) min loss: {:.4f} epochs since: {}".format(
+				       valid_loss_this_epoch, valid_time, datetime.now().time(),
+				       min_valid_loss, evals_since_min_valid_loss))
 
 				if evals_since_min_valid_loss >= patience:
 					break
@@ -1072,7 +1093,8 @@ if __name__ == "__main__":
 			plt.savefig(os.path.join(train_directory, "losses_from_train.pdf"))
 			plt.close()
 
-		chief_print("Done training. Wrote to {0}".format(train_directory))
+		chief_print("Done training at {0}. Wrote to {1}".format(
+	             datetime.now().time(), train_directory))
 		ae_weight_manager.cleanup()
 
 	if arguments['project']:
@@ -1102,17 +1124,14 @@ if __name__ == "__main__":
 		chief_print("Projecting epochs: {0}".format(epochs))
 		chief_print("Already projected: {0}".format(projected_epochs))
 
-		batch_size_project = batch_size
-		sparsify_fraction = 0.0
-
 		dg_args = {"filebase"             : data_prefix,
-		           "global_batch_size"    : batch_size_project,
+		           "global_batch_size"    : global_batch_size,
 		           "missing_mask"         : missing_mask_input,
 		           "valid_split"          : 0.0,
 		           "impute_missing"       : fill_missing,
 		           "normalization_mode"   : norm_mode,
 		           "normalization_options": norm_opts,
-		           "sparsifies"           : [sparsify_fraction],
+		           "sparsifies"           : [0.0],
 		           "pref_chunk_size"      : None, # auto
 		           "shuffle_dataset"      : False}
 		dg = data_generator_distrib(**dg_args)
