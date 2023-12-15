@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 import glob
+from math import floor
 import numpy as np
 import os
 import pathlib
@@ -42,10 +43,15 @@ class data_generator_distrib:
 	def __post_init__(self):
 		self.missing_val  = self.normalization_options["missing_val"]
 		self.total_chunks = None
+		self.filelist = []
+		self.samples_per_file = dict()
 
 		self._get_ind_pop_list()
 		self._get_n_markers()
 		self._define_samples()
+
+		self.define_validation_set(validation_split = self.valid_split,
+		                           random_state = self.valid_random_state)
 
 
 	def _get_ind_pop_list(self):
@@ -82,6 +88,7 @@ class data_generator_distrib:
 			indpop = indpop[:,[1,0]]
 			self.ind_pop_list=np.concatenate((self.ind_pop_list,indpop), axis=0)
 
+			self.filelist.append(pq_file)
 			self.samples_per_file[pq_file] = indpop.shape[0]
 
 		if self.ind_pop_list.shape[0] == 0:
@@ -101,9 +108,17 @@ class data_generator_distrib:
 		self.n_train_samples = len(self.ind_pop_list)
 		self.n_valid_samples = 0
 
-		self.sample_idx_all   = np.arange(self.n_total_samples)
-		self.sample_idx_train = np.arange(self.n_train_samples)
-		self.sample_idx_valid = np.arange(self.n_valid_samples)
+		self.sample_idx_all   = dict()
+		self.sample_idx_train = dict()
+		self.sample_idx_valid = dict()
+		start = 0
+		for f in self.filelist:
+			end = start + self.samples_per_file[f]
+			self.sample_idx_all[  f] = np.arange(start, end)
+			self.sample_idx_train[f] = np.arange(start, end)
+			self.sample_idx_valid[f] = np.arange(0)
+			start = end
+			assert len(self.sample_idx_all[f]) == self.samples_per_file[f]
 
 		self.ind_pop_list_train = np.copy(self.ind_pop_list)
 		self.ind_pop_list_valid = np.empty(shape=(0,2), dtype=str)
@@ -120,6 +135,9 @@ class data_generator_distrib:
 		batch_size  = input_context.get_per_replica_batch_size(self.global_batch_size)
 		#num_devices = input_context.num_replicas_in_sync
 		# TODO: could set one dtype for tfrecords and another for loading them
+
+		# reset train/valid split
+		self._define_samples()
 
 		existing_tfr_files=sorted(glob.glob(self.tfrecords_prefix+"*.tfrecords"))
 		if len(existing_tfr_files) == 0 or self.overwrite_tfrecords:
@@ -151,12 +169,6 @@ class data_generator_distrib:
 			raise ValueError(f"Invalid split argument ({split}): "+
 			                 "must be 'all', 'train' or 'valid'")
 
-		self.define_validation_set(validation_split = self.valid_split,
-		                           random_state = self.valid_random_state)
-		# TODO: maybe move it to post init later,
-		#       if we decide to abandon tfrecords for good.
-		#       or call it from outside.
-
 		if self.pref_chunk_size is None:
 			self.pref_chunk_size = auto_chunk_size(width=self.n_markers,
 			                                       dtype=self.geno_dtype)
@@ -184,7 +196,7 @@ class data_generator_distrib:
 		worker_id   = input_context.input_pipeline_id
 		batch_size  = input_context.get_per_replica_batch_size(self.global_batch_size)
 
-		pq_paths = sorted(glob.glob(self.filebase+"*.parquet"))
+		pq_paths = self.filelist
 		if len(pq_paths) % num_workers != 0:
 			raise RuntimeError(f"Can't distribute {len(pq_paths)} input files" +
 			                   f" evenly between {num_workers} workers")
@@ -250,28 +262,28 @@ class data_generator_distrib:
 		# https://www.tensorflow.org/guide/data
 		# https://stackoverflow.com/q/68164440
 
-		if type(split_) == bytes:
-			split_ = split_.decode()
-		if split_ == "all":
-			cur_sample_idx   = np.copy(self.sample_idx_all)
-			cur_ind_pop_list = np.copy(self.ind_pop_list)
-		elif split_ == "train":
-			cur_sample_idx   = np.copy(self.sample_idx_train)
-			cur_ind_pop_list = np.copy(self.ind_pop_list_train)
-		elif split_ == "valid":
-			cur_sample_idx   = np.copy(self.sample_idx_valid)
-			cur_ind_pop_list = np.copy(self.ind_pop_list_valid)
-		else:
-			raise ValueError(f"Invalid split_ argument ({split_}): "+
-			                 "must be 'all', 'train' or 'valid'")
-
 		if type(filepaths) == list and type(filepaths[0]) == bytes:
 			filepaths = [f.decode() for f in filepaths]
 		elif type(filepaths) == bytes:
-			filepaths = filepaths.decode()
+			filepaths = [filepaths.decode()]
 		else:
 			raise TypeError(f"Unsupported filepaths type: {type(filepaths)}")
 			# TODO: type all function args, actually
+
+		if type(split_) == bytes:
+			split_ = split_.decode()
+		if split_ == "all":
+			cur_sample_idx_per_file = self.sample_idx_all
+		elif split_ == "train":
+			cur_sample_idx_per_file = self.sample_idx_train
+		elif split_ == "valid":
+			cur_sample_idx_per_file = self.sample_idx_valid
+		else:
+			raise ValueError(f"Invalid split_ argument ({split_}): "+
+			                 "must be 'all', 'train' or 'valid'")
+		cur_sample_idx = np.concatenate([cur_sample_idx_per_file[f]
+		                                 for f in filepaths], axis=0)
+		cur_ind_pop_list = np.copy(self.ind_pop_list[cur_sample_idx,:])
 
 		# TODO: make sure to properly support multiple files, everywhere
 		int32_t_MAX = 2**31-1
@@ -288,7 +300,8 @@ class data_generator_distrib:
 		if (inds_sch[present_in_fam] != inds_fam[present_in_pq]).any():
 			raise ValueError("Parquet schema inconsistent with FAM files")
 
-		cur_sample_idx = tf.cast(cur_sample_idx[present_in_pq], tf.int32)
+		assert (cur_sample_idx[present_in_pq] == cur_sample_idx).all()
+		cur_sample_idx = tf.cast(cur_sample_idx, tf.int32)
 		if shuffle_:
 			cur_sample_idx = tf.random.shuffle(cur_sample_idx)
 		n_samples = len(cur_sample_idx)
@@ -318,6 +331,7 @@ class data_generator_distrib:
 				                f"files: {self.n_markers} markers expected "+
 				                f"but {chunk.shape[1]} markers read")
 			chunks_read += 1
+			# TODO: this sanity check needs to account for dropped inds
 
 			batches_read = 0
 			last_batch_in_chunk = False
@@ -429,21 +443,35 @@ class data_generator_distrib:
 
 	def define_validation_set(self, validation_split, random_state=None):
 		# TODO: should be stratified by population in the general case
-		self.n_valid_samples = int(np.floor(self.n_total_samples * validation_split))
-		self.n_train_samples = self.n_total_samples - self.n_valid_samples
+		self.n_valid_samples = 0
+		self.n_train_samples = 0
 
 		np.random.seed(random_state)
-		self.sample_idx_valid = np.random.choice(self.sample_idx_all,
-		                                         size=self.n_valid_samples,
-		                                         replace=False)
-		self.sample_idx_valid = np.sort(self.sample_idx_valid)
-		train_idx = np.in1d(self.sample_idx_all, self.sample_idx_valid,
-		                    invert=True)
-		self.sample_idx_train = np.copy(self.sample_idx_all[train_idx])
-		self.sample_idx_train = np.sort(self.sample_idx_train)
+		for f in self.filelist:
+			n_valid = floor(self.samples_per_file[f] * validation_split)
+			n_train = self.samples_per_file[f] - n_valid
+			self.sample_idx_valid[f] = np.random.choice(self.sample_idx_all[f],
+			                                            size=n_valid,
+			                                            replace=False)
+			self.sample_idx_valid[f] = np.sort(self.sample_idx_valid[f])
+			train_idx = np.in1d(self.sample_idx_all[f],
+			                    self.sample_idx_valid[f],
+			                    invert=True)
+			self.sample_idx_train[f] = np.copy(self.sample_idx_all[f][train_idx])
+			self.sample_idx_train[f] = np.sort(self.sample_idx_train[f])
 
-		self.ind_pop_list_train=np.copy(self.ind_pop_list[self.sample_idx_train,:])
-		self.ind_pop_list_valid=np.copy(self.ind_pop_list[self.sample_idx_valid,:])
+			self.n_valid_samples += n_valid
+			self.n_train_samples += n_train
+			assert len(self.sample_idx_train[f]) == n_train
+
+		assert self.n_train_samples == self.n_total_samples-self.n_valid_samples
+
+		sample_idx_train_all = np.concatenate([self.sample_idx_train[f]
+		                                       for f in self.filelist], axis=0)
+		sample_idx_valid_all = np.concatenate([self.sample_idx_valid[f]
+		                                       for f in self.filelist], axis=0)
+		self.ind_pop_list_train=np.copy(self.ind_pop_list[sample_idx_train_all,:])
+		self.ind_pop_list_valid=np.copy(self.ind_pop_list[sample_idx_valid_all,:])
 
 
 	def finalize_train_valid_sets(self, dataset, batch_size_):
@@ -574,5 +602,5 @@ def auto_chunk_size(width, dtype, k=0.1):
 
 	max_ram = k*virtual_memory().available
 	bytes_per_val = np.dtype(dtype).itemsize
-	chunksize = np.floor(max_ram / (bytes_per_val * width)).astype(int)
+	chunksize = floor(max_ram / (bytes_per_val * width))
 	return chunksize
