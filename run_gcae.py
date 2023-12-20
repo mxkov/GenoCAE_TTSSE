@@ -60,6 +60,7 @@ import copy
 import h5py
 import matplotlib.animation as animation
 from pathlib import Path
+from psutil import virtual_memory
 
 # TODO: add PerReplica checks!!!
 
@@ -530,6 +531,109 @@ class WeightKeeper:
 		if not _isChief():
 			assert self.weights_dir != self.weights_dir_chief
 			shutil.rmtree(self.weights_dir)
+
+
+class ProjectedOutput:
+	"""Keeps track of projection results and related data for one saved epoch"""
+
+	def __init__(self, n_latent_dim_, n_markers_, n_total_samples_,
+	                   results_dir, epoch_, n_workers,
+	                   store=None):
+		# TODO: make this multi-worker
+		self.outdir = os.path.join(results_dir, f"projected_{epoch_}")
+		os.makedirs(self.outdir, exist_ok=True)
+
+		self.n_dim = n_latent_dim_
+		self.n_markers = n_markers_
+		self.n_total_samples = n_total_samples_
+		self.num_workers = n_workers
+		self.store = store
+
+		self.ind_pop_list = np.empty(shape=(0,2), dtype=str)
+		self.encoded      = np.empty((0, self.n_dim))
+		self.decoded      = np.empty((0, self.n_markers))
+		self.targets      = np.empty((0, self.n_markers))
+		self.orig_mask    = np.empty((0, self.n_markers))
+
+		self.metrics = dict()
+
+
+	def _do_we_store_all_outputs(self, encoded, decoded, targets, mask, k=0.3):
+		"""Auto-determine if all outputs can be stored in memory"""
+		if k >= 1.0 or k <= 0:
+			raise ValueError("Invalid k argument: should lie between 0 and 1")
+
+		arr_sizes_per_sample = [
+		  2*50*4,  # ind_pop_list, overestimated
+		  self.n_dim * encoded.dtype.itemsize,
+		  self.n_markers * decoded.dtype.itemsize,
+		  self.n_markers * targets.dtype.itemsize,
+		  self.n_markers * mask.dtype.itemsize
+		]
+		total_size = sum(arr_sizes_per_sample) * self.n_total_samples  # bytes
+		max_ram = k*virtual_memory().available
+		if total_size > max_ram:
+			self.store = False
+		else:
+			self.store = True
+
+
+	def update(self, ind_pop_upd, encoded_upd, decoded_upd,
+	                 targets_upd, orig_mask_upd):
+		"""Add new portion of projection results"""
+		ind_pop_upd   = np.array(ind_pop_upd)
+		encoded_upd   = np.array(encoded_upd)
+		decoded_upd   = np.array(decoded_upd[:,0:self.n_markers])
+		targets_upd   = np.array(targets_upd[:,0:self.n_markers])
+		orig_mask_upd = np.array(orig_mask_upd)
+
+		if self.store is None:
+			self._do_we_store_all_outputs(encoded_upd, decoded_upd,
+			                              targets_upd, orig_mask_upd)
+
+		self.ind_pop_list = np.concatenate((self.ind_pop_list,
+		                                    ind_pop_upd), axis=0)
+		self.encoded = np.concatenate((self.encoded, encoded_upd), axis=0)
+
+		if self.store:
+			self.decoded   = np.concatenate((self.decoded, decoded_upd), axis=0)
+			self.targets   = np.concatenate((self.targets, targets_upd), axis=0)
+			self.orig_mask = np.concatenate((self.orig_mask, orig_mask_upd),
+			                                axis=0)
+		else:
+			self.decoded   = decoded_upd
+			self.targets   = targets_upd
+			self.orig_mask = orig_mask_upd
+
+
+	def evaluate(self):
+		"""Get metrics for currently stored projection results"""
+		metrics_upd = EvalProjected(self.decoded, self.targets, self.orig_mask)
+		if len(self.metrics) == 0:
+			self.metrics = metrics_upd
+			return
+		for m in self.metrics:
+			try:
+				self.metrics[m] += metrics_upd[m]
+			except KeyError:
+				continue
+
+	def combine_metrics(self):
+		"""Convert per-batch metrics into final ones"""
+		return
+
+	def write(self):
+		# write to files. per-worker!
+		# maybe combine files in the end, if many workers
+		return
+
+
+
+def EvalProjected(decoded, targets, orig_mask):
+	"""Get metrics for projection results"""
+	orig_mask = tf.cast(orig_mask, tf.bool)
+	metrics = dict()
+	return metrics
 
 
 
@@ -1146,6 +1250,7 @@ if __name__ == "__main__":
 		           "shuffle_dataset"      : False}
 		dg = data_generator_distrib(**dg_args)
 		n_markers = copy.deepcopy(dg.n_markers)
+		n_unique_samples = copy.deepcopy(dg.n_total_samples)
 
 		# dds stands for tfd.DistributedDataset
 		dds_proj = strat.distribute_datasets_from_function(
@@ -1157,7 +1262,7 @@ if __name__ == "__main__":
 		# TODO: actually we do need the strat.
 		#       so we can properly finalize the dataset.
 		#       that was avoidable, but whoops, too late.
-		genotype_concordance_metric = GenotypeConcordance()
+		genotype_concordance_metric = GenotypeConcordance() # TODO: put it in scope???
 		with strat.scope():
 			autoencoder = Autoencoder(model_architecture, n_markers,
 			                          noise_std, regularizer)
@@ -1200,15 +1305,14 @@ if __name__ == "__main__":
 			with strat.scope():
 				autoencoder.load_weights(weights_file_prefix)
 
-			ind_pop_list_train = np.empty(shape=(0,2), dtype=str)
-			encoded_train = np.empty((0, n_latent_dim))
-			decoded_train = None
-			targets_train = np.empty((0, n_markers))
-			orig_mask_train = np.empty((0, n_markers))
-			# TODO: all these arrays might outgrow RAM. do something.
+			projected_data = ProjectedOutput(n_latent_dim, n_markers,
+			                                 n_unique_samples,
+			                                 results_directory, epoch,
+			                                 num_workers)
 
 			loss_value_per_batch = []
 			genotype_conc_per_batch = []
+			genotype_concordance_metric.reset_states()
 
 			for batch_input, batch_target,\
 			    batch_orig_mask, batch_indpop, _ in dds_proj:
@@ -1219,36 +1323,33 @@ if __name__ == "__main__":
 				                       y_true=batch_target,
 				                       orig_nonmissing_mask=batch_orig_mask,
 				                       model_losses=autoencoder.losses)
-
-				ind_pop_list_train=np.concatenate((ind_pop_list_train, batch_indpop), axis=0)
-				encoded_train=np.concatenate((encoded_train, encoded_batch), axis=0)
-				if decoded_train is None:
-					decoded_train=np.copy(decoded_batch[:,0:n_markers])
-				else:
-					decoded_train=np.concatenate((decoded_train, decoded_batch[:,0:n_markers]), axis=0)
-				targets_train=np.concatenate((targets_train, batch_target[:,0:n_markers]), axis=0)
-
-				orig_mask_train = np.concatenate((orig_mask_train,
-				                                  batch_orig_mask), axis=0)
-
 				loss_value_per_batch.append(loss_batch)
 
-			ind_pop_list_train = np.array(ind_pop_list_train)
-			encoded_train = np.array(encoded_train)
-			orig_mask_train = tf.cast(orig_mask_train, tf.bool)
+				projected_data.update(batch_indpop, encoded_batch,
+				                      decoded_batch, batch_target,
+				                      batch_orig_mask)
+				if not projected_data.store:
+					projected_data.evaluate()
+
+			if not projected_data.store:
+				projected_data.combine_metrics()
+			else:
+				projected_data.evaluate()
+
 			loss_value = np.average(loss_value_per_batch)
 
 			if epoch == epochs[0]:
-				assert len(ind_pop_list_train) == dg.n_total_samples, \
-				       f"{len(ind_pop_list_train)} vs {dg.n_total_samples}"
-				assert len(encoded_train) == dg.n_total_samples, \
-				       f"{len(encoded_train)} vs {dg.n_total_samples}"
+				assert len(projected_data.ind_pop_list) == dg.n_total_samples, \
+				       f"{len(projected_data.ind_pop_list)} vs {dg.n_total_samples}"
+				assert len(projected_data.encoded) == dg.n_total_samples, \
+				       f"{len(projected_data.encoded)} vs {dg.n_total_samples}"
 
 				write_h5(encoded_data_file, "ind_pop_list_train",
-				         np.array(ind_pop_list_train, dtype='S'))
+				         np.array(projected_data.ind_pop_list, dtype='S'))
 
 			genotype_concordance_metric.reset_states()
 
+			orig_mask_train = tf.cast(projected_data.orig_mask, tf.bool)
 			# TODO: maybe copy train_opts to project_opts in this mode or something. just for clarity.
 			if train_opts["loss"]["class"] == "MeanSquaredError" and (data_opts["norm_mode"] == "smartPCAstyle" or data_opts["norm_mode"] == "standard"):
 				try:
@@ -1258,21 +1359,21 @@ if __name__ == "__main__":
 					genotypes_output = np.array([])
 					true_genotypes = np.array([])
 
-				genotypes_output = to_genotypes_invscale_round(decoded_train[:, 0:n_markers], scaler_vals = scaler)
-				true_genotypes = to_genotypes_invscale_round(targets_train, scaler_vals = scaler)
+				genotypes_output = to_genotypes_invscale_round(projected_data.decoded, scaler_vals = scaler)
+				true_genotypes = to_genotypes_invscale_round(projected_data.targets, scaler_vals = scaler)
 				genotype_concordance_metric.update_state(y_pred = genotypes_output[orig_mask_train],
 				                                         y_true = true_genotypes[orig_mask_train])
 
 
 			elif train_opts["loss"]["class"] == "BinaryCrossentropy" and data_opts["norm_mode"] == "genotypewise01":
-				genotypes_output = to_genotypes_sigmoid_round(decoded_train[:, 0:n_markers])
-				true_genotypes = targets_train
+				genotypes_output = to_genotypes_sigmoid_round(projected_data.decoded)
+				true_genotypes = projected_data.targets
 				genotype_concordance_metric.update_state(y_pred = genotypes_output[orig_mask_train],
 				                                         y_true = true_genotypes[orig_mask_train])
 
 			elif train_opts["loss"]["class"] in ["CategoricalCrossentropy", "KLDivergence"] and data_opts["norm_mode"] == "genotypewise01":
-				genotypes_output = tf.cast(tf.argmax(alfreqvector(decoded_train[:, 0:n_markers]), axis = -1), tf.float16) * 0.5
-				true_genotypes = targets_train
+				genotypes_output = tf.cast(tf.argmax(alfreqvector(projected_data.decoded), axis = -1), tf.float16) * 0.5
+				true_genotypes = projected_data.targets
 				genotype_concordance_metric.update_state(y_pred = genotypes_output[orig_mask_train],
 				                                         y_true = true_genotypes[orig_mask_train])
 
@@ -1289,7 +1390,7 @@ if __name__ == "__main__":
 			if superpopulations_file:
 				# TODO: might have to reimplement all these functions from the old data handler,
 				#       to make them work with the new one.
-				coords_by_pop = get_coords_by_pop(data_prefix, encoded_train, ind_pop_list = ind_pop_list_train)
+				coords_by_pop = get_coords_by_pop(data_prefix, projected_data.encoded, ind_pop_list = projected_data.ind_pop_list)
 
 				if doing_clustering:
 					plot_clusters_by_superpop(coords_by_pop,
@@ -1312,16 +1413,16 @@ if __name__ == "__main__":
 
 			else:
 				try:
-					coords_by_pop = get_coords_by_pop(data_prefix, encoded_train, ind_pop_list = ind_pop_list_train)
+					coords_by_pop = get_coords_by_pop(data_prefix, projected_data.encoded, ind_pop_list = projected_data.ind_pop_list)
 					plot_coords_by_pop(coords_by_pop,
 					                   os.path.join(results_directory,
 					                                f"dimred_e_{epoch}_by_pop"))
 				except:
-					plot_coords(encoded_train,
+					plot_coords(projected_data.encoded,
 					            os.path.join(results_directory,
 					                         f"dimred_e_{epoch}"))
 
-			write_h5(encoded_data_file, f"{epoch}_encoded_train", encoded_train)
+			write_h5(encoded_data_file, f"{epoch}_encoded_train", projected_data.encoded)
 
 		try:
 			plot_genotype_hist(np.array(genotypes_output),
