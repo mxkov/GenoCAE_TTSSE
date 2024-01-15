@@ -39,6 +39,7 @@ import tensorflow as tf
 import tensorflow.distribute as tfd
 import tensorflow.distribute.experimental as tfde
 from tensorflow.keras import Model, layers
+from tensorflow.python.distribute.values import PerReplica
 from tensorflow.python.training.server_lib import ClusterSpec
 from datetime import datetime
 from utils.data_handler_distrib import data_generator_distrib # TODO: look into reimplementing all these below as well:
@@ -62,7 +63,6 @@ import matplotlib.animation as animation
 from pathlib import Path
 from psutil import virtual_memory
 
-# TODO: add PerReplica checks!!!
 
 def _isChief():
 	if "isChief" in os.environ:
@@ -578,14 +578,43 @@ class ProjectedOutput:
 			self.store = True
 
 
+	def _unpack_from_replicas(self, *args):
+		"""Combine projected data from all devices on this worker"""
+		# TODO: standalone function instead of class method?
+		all_items = list(args)
+
+		pr_checks = [type(item)==PerReplica for item in all_items]
+		one_replica   = not any(pr_checks)
+		many_replicas = all(pr_checks)
+		assert one_replica or many_replicas
+
+		if one_replica:
+			all_items = [np.array(item) for item in all_items]
+			return (*all_items,)
+
+		# list of PerReplica`s -> list of tuples:
+		all_items = [item.values for item in all_items]
+
+		replica_counts = [len(item) for item in all_items]
+		assert all([c==replica_counts[0] for c in replica_counts[1:]])
+		num_replicas = replica_counts[0]
+
+		# list of tuples -> list of numpy.ndarray`s:
+		all_items = [np.concatenate([np.array(a) for a in item], axis=0)
+		             for item in all_items]
+
+		return (*all_items,)
+
+
 	def update(self, ind_pop_upd, encoded_upd, decoded_upd,
 	                 targets_upd, orig_mask_upd):
 		"""Add new portion of projection results"""
-		ind_pop_upd   = np.array(ind_pop_upd)
-		encoded_upd   = np.array(encoded_upd)
-		decoded_upd   = np.array(decoded_upd[:,0:self.n_markers])
-		targets_upd   = np.array(targets_upd[:,0:self.n_markers])
-		orig_mask_upd = np.array(orig_mask_upd)
+		ind_pop_upd, encoded_upd, decoded_upd, \
+		    targets_upd, orig_mask_upd = self._unpack_from_replicas(
+		    ind_pop_upd, encoded_upd, decoded_upd, targets_upd, orig_mask_upd)
+
+		decoded_upd = decoded_upd[:,0:self.n_markers]
+		targets_upd = targets_upd[:,0:self.n_markers]
 
 		if self.store is None:
 			self._do_we_store_all_outputs(encoded_upd, decoded_upd,
@@ -1044,7 +1073,7 @@ if __name__ == "__main__":
 		(input_init, targets_init,
 		    orig_mask_init, _, _) = next(iter(dds_train))
 		# get the same for every device
-		if num_devices > 1: # TODO: replace with PerReplica check
+		if type(input_init) == PerReplica:
 			input_init     = input_init.values[0]
 			targets_init   = targets_init.values[0]
 			orig_mask_init = orig_mask_init.values[0]
@@ -1308,7 +1337,7 @@ if __name__ == "__main__":
 			projected_data = ProjectedOutput(n_latent_dim, n_markers,
 			                                 n_unique_samples,
 			                                 results_directory, epoch,
-			                                 num_workers)
+			                                 num_workers, store=False)
 
 			loss_value_per_batch = []
 			genotype_conc_per_batch = []
