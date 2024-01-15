@@ -1169,12 +1169,12 @@ if __name__ == "__main__":
 				startTime = datetime.now()
 
 				for batch_input_valid, batch_target_valid,\
-				    batch_orig_mask, _, _ in dds_valid:
+				    batch_orig_mask_valid, _, _ in dds_valid:
 					valid_loss_batch = compute_loss_distrib(autoencoder,
 					                                        loss_func,
 					                                        batch_input_valid,
 					                                        batch_target_valid,
-					                                        batch_orig_mask)
+					                                        batch_orig_mask_valid)
 					losses_v_batches.append(valid_loss_batch)
 					batch_count_valid += 1
 					if max_batches is not None and batch_count_valid > max_batches:
@@ -1366,6 +1366,7 @@ if __name__ == "__main__":
 				projected_data.evaluate()
 
 			loss_value = np.average(loss_value_per_batch)
+			losses_train.append(loss_value)
 
 			if epoch == epochs[0]:
 				assert len(projected_data.ind_pop_list) == dg.n_total_samples, \
@@ -1376,45 +1377,50 @@ if __name__ == "__main__":
 				write_h5(encoded_data_file, "ind_pop_list_train",
 				         np.array(projected_data.ind_pop_list, dtype='S'))
 
-			genotype_concordance_metric.reset_states()
 
-			orig_mask_train = tf.cast(projected_data.orig_mask, tf.bool)
-			# TODO: maybe copy train_opts to project_opts in this mode or something. just for clarity.
-			if train_opts["loss"]["class"] == "MeanSquaredError" and (data_opts["norm_mode"] == "smartPCAstyle" or data_opts["norm_mode"] == "standard"):
-				try:
-					scaler = dg.scaler
-				except:
-					chief_print("Could not calculate predicted genotypes and genotype concordance. No scaler available in data handler.")
+			######## GC CALC
+
+			if False:
+				genotype_concordance_metric.reset_states()
+	
+				orig_mask_train = tf.cast(projected_data.orig_mask, tf.bool)
+				# TODO: maybe copy train_opts to project_opts in this mode or something. just for clarity.
+				if train_opts["loss"]["class"] == "MeanSquaredError" and (data_opts["norm_mode"] == "smartPCAstyle" or data_opts["norm_mode"] == "standard"):
+					try:
+						scaler = dg.scaler
+					except:
+						chief_print("Could not calculate predicted genotypes and genotype concordance. No scaler available in data handler.")
+						genotypes_output = np.array([])
+						true_genotypes = np.array([])
+	
+					genotypes_output = to_genotypes_invscale_round(projected_data.decoded, scaler_vals = scaler)
+					true_genotypes = to_genotypes_invscale_round(projected_data.targets, scaler_vals = scaler)
+					genotype_concordance_metric.update_state(y_pred = genotypes_output[orig_mask_train],
+					                                         y_true = true_genotypes[orig_mask_train])
+	
+	
+				elif train_opts["loss"]["class"] == "BinaryCrossentropy" and data_opts["norm_mode"] == "genotypewise01":
+					genotypes_output = to_genotypes_sigmoid_round(projected_data.decoded)
+					true_genotypes = projected_data.targets
+					genotype_concordance_metric.update_state(y_pred = genotypes_output[orig_mask_train],
+					                                         y_true = true_genotypes[orig_mask_train])
+	
+				elif train_opts["loss"]["class"] in ["CategoricalCrossentropy", "KLDivergence"] and data_opts["norm_mode"] == "genotypewise01":
+					genotypes_output = tf.cast(tf.argmax(alfreqvector(projected_data.decoded), axis = -1), tf.float16) * 0.5
+					true_genotypes = projected_data.targets
+					genotype_concordance_metric.update_state(y_pred = genotypes_output[orig_mask_train],
+					                                         y_true = true_genotypes[orig_mask_train])
+	
+				else:
+					chief_print("Could not calculate predicted genotypes and genotype concordance. Not implemented for loss {0} and normalization {1}.".format(train_opts["loss"]["class"], data_opts["norm_mode"]))
 					genotypes_output = np.array([])
 					true_genotypes = np.array([])
+	
+				genotype_concordance_value = genotype_concordance_metric.result()
+				genotype_concs_train.append(genotype_concordance_value)
 
-				genotypes_output = to_genotypes_invscale_round(projected_data.decoded, scaler_vals = scaler)
-				true_genotypes = to_genotypes_invscale_round(projected_data.targets, scaler_vals = scaler)
-				genotype_concordance_metric.update_state(y_pred = genotypes_output[orig_mask_train],
-				                                         y_true = true_genotypes[orig_mask_train])
+			######## END GC CALC
 
-
-			elif train_opts["loss"]["class"] == "BinaryCrossentropy" and data_opts["norm_mode"] == "genotypewise01":
-				genotypes_output = to_genotypes_sigmoid_round(projected_data.decoded)
-				true_genotypes = projected_data.targets
-				genotype_concordance_metric.update_state(y_pred = genotypes_output[orig_mask_train],
-				                                         y_true = true_genotypes[orig_mask_train])
-
-			elif train_opts["loss"]["class"] in ["CategoricalCrossentropy", "KLDivergence"] and data_opts["norm_mode"] == "genotypewise01":
-				genotypes_output = tf.cast(tf.argmax(alfreqvector(projected_data.decoded), axis = -1), tf.float16) * 0.5
-				true_genotypes = projected_data.targets
-				genotype_concordance_metric.update_state(y_pred = genotypes_output[orig_mask_train],
-				                                         y_true = true_genotypes[orig_mask_train])
-
-			else:
-				chief_print("Could not calculate predicted genotypes and genotype concordance. Not implemented for loss {0} and normalization {1}.".format(train_opts["loss"]["class"], data_opts["norm_mode"]))
-				genotypes_output = np.array([])
-				true_genotypes = np.array([])
-
-			genotype_concordance_value = genotype_concordance_metric.result()
-
-			losses_train.append(loss_value)
-			genotype_concs_train.append(genotype_concordance_value)
 
 			if superpopulations_file:
 				# TODO: might have to reimplement all these functions from the old data handler,
@@ -1453,15 +1459,18 @@ if __name__ == "__main__":
 
 			write_h5(encoded_data_file, f"{epoch}_encoded_train", projected_data.encoded)
 
-		try:
-			plot_genotype_hist(np.array(genotypes_output),
-			                   os.path.join(results_directory,
-			                                f"output_as_genotypes_e{epoch}"))
-			plot_genotype_hist(np.array(true_genotypes),
-			                   os.path.join(results_directory,
-			                                "true_genotypes"))
-		except:
-			pass
+		######## TRUE GENOS
+		if False:
+			try:
+				plot_genotype_hist(np.array(genotypes_output),
+				                   os.path.join(results_directory,
+				                                f"output_as_genotypes_e{epoch}"))
+				plot_genotype_hist(np.array(true_genotypes),
+				                   os.path.join(results_directory,
+				                                "true_genotypes"))
+			except:
+				pass
+		######## END TRUE GENOS
 
 		############################### losses ##############################
 
@@ -1478,24 +1487,28 @@ if __name__ == "__main__":
 
 
 		############################### gconc ###############################
-		try:
-			baseline_genotype_concordance = get_baseline_gc(true_genotypes)
-		except:
-			baseline_genotype_concordance = None
 
-		outfilename = os.path.join(results_directory, "genotype_concordances.csv")
-		epochs_combined, genotype_concs_combined = write_metric_per_epoch_to_csv(outfilename, genotype_concs_train, epochs)
+		######## GC OUT
+		if False:
+			try:
+				baseline_genotype_concordance = get_baseline_gc(true_genotypes)
+			except:
+				baseline_genotype_concordance = None
 
-		plt.plot(epochs_combined, genotype_concs_combined, label="train", c="orange")
-		if baseline_genotype_concordance:
-			plt.plot([epochs_combined[0], epochs_combined[-1]], [baseline_genotype_concordance, baseline_genotype_concordance], label="baseline", c="black")
-
-		plt.xlabel("Epoch")
-		plt.ylabel("Genotype concordance")
-
-		plt.savefig(os.path.join(results_directory, "genotype_concordances.pdf"))
-
-		plt.close()
+			outfilename = os.path.join(results_directory, "genotype_concordances.csv")
+			epochs_combined, genotype_concs_combined = write_metric_per_epoch_to_csv(outfilename, genotype_concs_train, epochs)
+	
+			plt.plot(epochs_combined, genotype_concs_combined, label="train", c="orange")
+			if baseline_genotype_concordance:
+				plt.plot([epochs_combined[0], epochs_combined[-1]], [baseline_genotype_concordance, baseline_genotype_concordance], label="baseline", c="black")
+	
+			plt.xlabel("Epoch")
+			plt.ylabel("Genotype concordance")
+	
+			plt.savefig(os.path.join(results_directory, "genotype_concordances.pdf"))
+	
+			plt.close()
+		######## END GC OUT
 
 	if arguments['animate']:
 		if not isChief:
