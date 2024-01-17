@@ -1,7 +1,7 @@
 """GenoCAE.
 
 Usage:
-  run_gcae.py train --datadir=<name> --data=<name> --model_id=<name> --train_opts_id=<name> --data_opts_id=<name> --epochs=<num> [--resume_from=<num> --trainedmodeldir=<name> --patience=<num> --save_interval=<num> --start_saving_from=<num> ]
+  run_gcae.py train --datadir=<name> --data=<name> --model_id=<name> --train_opts_id=<name> --data_opts_id=<name> --epochs=<num> [--resume_from=<num> --trainedmodeldir=<name> --patience=<num> --save_interval=<num> --loss_interval=<num> --start_saving_from=<num> ]
   run_gcae.py project --datadir=<name>   [ --data=<name> --model_id=<name>  --train_opts_id=<name> --data_opts_id=<name> --superpops=<name> --epoch=<num> --trainedmodeldir=<name>   --pdata=<name> --trainedmodelname=<name>]
   run_gcae.py plot --datadir=<name> [  --data=<name>  --model_id=<name> --train_opts_id=<name> --data_opts_id=<name>  --superpops=<name> --epoch=<num> --trainedmodeldir=<name>  --pdata=<name> --trainedmodelname=<name>]
   run_gcae.py animate --datadir=<name>   [ --data=<name>   --model_id=<name> --train_opts_id=<name> --data_opts_id=<name>  --superpops=<name> --epoch=<num> --trainedmodeldir=<name> --pdata=<name> --trainedmodelname=<name>]
@@ -17,6 +17,7 @@ Options:
   --data_opts_id=<name>      data options id, corresponding to a file data_opts/{data_opts_id}.json
   --epochs<num>              number of epochs to train
   --resume_from<num>         saved epoch to resume training from. set to -1 for latest saved epoch. DEFAULT: None (don't resume)
+  --loss_interval<num>       track train & valid loss every <this number> samples. DEFAULT: None (only track once per epoch)
   --save_interval<num>       epoch intervals at which to save state of model. DEFAULT: None (don't save)
   --start_saving_from<num>   number of epochs to train before starting to save model state. DEFAULT: 0.
   --trainedmodelname=<name>  name of the model training directory to fetch saved model state from when project/plot/evaluating
@@ -24,7 +25,7 @@ Options:
   --epoch<num>               epoch at which to project/plot/evaluate data. DEFAULT: all saved epochs
   --superpops<name>          path+filename of file mapping populations to superpopulations. used to color populations of the same superpopulation in similar colors in plotting. if not absolute path: assumed relative to GenoCAE/ directory.
   --metrics=<name>           the metric(s) to evaluate, e.g. hull_error of f1 score. can pass a list with multiple metrics, e.g. "f1_score_3,f1_score_5". DEFAULT: f1_score_3
-  --patience=<num>           stop training after this number of epochs without improving lowest validation. DEFAULT: None
+  --patience=<num>           stop training after this number of steps (batches) without improving lowest validation. DEFAULT: None
 
 """
 
@@ -75,6 +76,7 @@ def chief_print1(msg):
 			print(msg)
 	else:
 		print(msg)
+chief_print = print
 
 
 class SlurmClusterResolver_fixed(tfd.cluster_resolver.SlurmClusterResolver):
@@ -667,7 +669,6 @@ def EvalProjected(decoded, targets, orig_mask):
 
 
 if __name__ == "__main__":
-	chief_print = print
 	chief_print(f"\n{datetime.now().time()}\n")
 	chief_print("tensorflow version {0}".format(tf.__version__))
 	tf.keras.backend.set_floatx('float32')
@@ -934,6 +935,11 @@ if __name__ == "__main__":
 			save_interval = epochs
 
 		try:
+			loss_interval = int(arguments["loss_interval"])
+		except:
+			loss_interval = None
+
+		try:
 			start_saving_from = int(arguments["start_saving_from"])
 		except:
 			start_saving_from = 0
@@ -941,7 +947,7 @@ if __name__ == "__main__":
 		try:
 			patience = int(arguments["patience"])
 		except:
-			patience = epochs
+			patience = None
 
 		try:
 			resume_from = int(arguments["resume_from"])
@@ -1102,23 +1108,116 @@ if __name__ == "__main__":
 
 		######### Create objects for tensorboard summary ###############################
 
-		if isChief: # TODO: make sure only chief can write to it
+		if isChief:
 			twdir = os.path.join(train_directory, "train")
 			vwdir = os.path.join(train_directory, "valid")
 			train_writer = tf.summary.create_file_writer(twdir)
 			valid_writer = tf.summary.create_file_writer(vwdir)
 
+		def WriteSummaryTrain(loss_value, step_count):
+			if not isChief:
+				return
+			with train_writer.as_default():
+				tf.summary.scalar("loss", loss_value, step=step_count)
+				if lr_schedule:
+					tf.summary.scalar("learning_rate",
+					        optimizer._decayed_lr(var_dtype=tf.float32),
+					        step=step_count)
+				else:
+					tf.summary.scalar("learning_rate", learning_rate,
+					                  step=step_count)
+
+		def WriteSummaryValid(loss_value, step_count):
+			if not isChief:
+				return
+			with valid_writer.as_default():
+				tf.summary.scalar("loss", loss_value, step=step_count)
+
 		######################################################
 
 		# train losses per epoch
-		losses_t = []
 		# valid losses per epoch
-		losses_v = []
+		# ^ both gone. might re-add later
+		# train losses per step
+		losses_t_steps = []
+		all_steps = []
+		
 		# min loss stats
 		min_valid_loss = np.inf
 		min_valid_loss_epoch = None
+		min_valid_loss_step  = None
+		evals_since_min_valid_loss = -1
+		batches_since_last_valid = 0
+
+		# running loss tracking
+		batches_since_last_loss = 0  # global ones!
+		accum_loss_t = 0.0
+		tracked_steps_t  = []
+		tracked_steps_v  = []
+		tracked_losses_t = []
+		tracked_losses_v = []
+
+		# TODO: this impl relies on outer scope vars for tracking.
+		#       e.g. min_valid_loss_epoch.
+		#       and also appends to lists from the outer scope, e.g. losses_v.
+		#       gotta tuck those loose ends in somehow. callback?
+		def RunValidation(eff_epoch, step_count):
+			if n_valid_samples <= 0:
+				return np.inf, np.inf, None, -1
+
+			losses_v_batches = []
+			batch_count_valid = 0
+			
+			startTime = datetime.now()
+
+			for batch_input_valid, batch_target_valid,\
+			    batch_orig_mask_valid, _, _ in dds_valid:
+				valid_loss_batch = compute_loss_distrib(autoencoder,
+				                                        loss_func,
+				                                        batch_input_valid,
+				                                        batch_target_valid,
+				                                        batch_orig_mask_valid)
+				losses_v_batches.append(valid_loss_batch)
+				batch_count_valid += 1
+				if max_batches is not None and batch_count_valid > max_batches:
+					break
+			valid_loss_this_epoch_ = np.average(losses_v_batches)
+
+			valid_time = (datetime.now() - startTime).total_seconds()
+
+			# danger zone 1: retrieving outer-scope variables here.
+			# will rework later.
+			min_valid_loss_ = min_valid_loss
+			min_valid_loss_epoch_ = min_valid_loss_epoch
+			min_valid_loss_step_  = min_valid_loss_step
+			# end danger zone 1
+			if valid_loss_this_epoch_ <= min_valid_loss_:
+				min_valid_loss_ = valid_loss_this_epoch_
+				min_valid_loss_epoch_ = eff_epoch
+				min_valid_loss_step_ = step_count
+
+			#evals_since_min_valid_loss_ = eff_epoch - min_valid_loss_epoch_
+			evals_since_min_valid_loss_ = step_count - min_valid_loss_step_
+			timenow = datetime.now().time()
+			chief_print("--- Valid loss: {:.4f} ".format(valid_loss_this_epoch_) +
+			           f" time: {valid_time} ({timenow})" +
+			            " min loss: {:.4f} ".format(min_valid_loss_) +
+			           f" steps since: {evals_since_min_valid_loss_}")
+
+			# danger zone 2: adding to outer-scope lists
+			tracked_steps_v.append(step_count)
+			tracked_losses_v.append(valid_loss_this_epoch_)
+			WriteSummaryValid(valid_loss_this_epoch_, step_count)
+			# end danger zone 2
+
+			return valid_loss_this_epoch_, min_valid_loss_,\
+			       min_valid_loss_epoch_, evals_since_min_valid_loss_
+
+		######################################################
 
 		chief_print(f"\nTraining start: {datetime.now().time()}")
+		chief_print(f"Step count: {step_counter}")
+		chief_print(f"Valid samples: {n_valid_samples}")
 
 		for e in range(1,epochs+1):
 			# TODO: profiler, mayhaps?
@@ -1126,85 +1225,77 @@ if __name__ == "__main__":
 			startTime = datetime.now()
 			effective_epoch = e + resume_from
 			losses_t_batches = []
-			losses_v_batches = []
 			batch_count_train = 0
-			batch_count_valid = 0
+
+			chief_print("\nEpoch: {}/{}...".format(effective_epoch, epochs+resume_from))
 
 			for batch_input, batch_target, batch_orig_mask, _, _ in dds_train:
+				step_counter += 1
+				all_steps.append(step_counter)
 				train_batch_loss = train_step_distrib(autoencoder,
 				                                      optimizer, loss_func,
 				                                      batch_input, batch_target,
 				                                      batch_orig_mask)
 				losses_t_batches.append(train_batch_loss)
-				step_counter += 1
 				batch_count_train += 1
 				if max_batches is not None and batch_count_train > max_batches:
 					break
-			train_loss_this_epoch = np.average(losses_t_batches)
 
+				# TODO: this averages losses over loss_interval.
+				#       could accumulate & average over all preceding batches instead.
+				accum_loss_t += train_batch_loss
+				batches_since_last_loss  += 1
+				batches_since_last_valid += 1
+				if (loss_interval is not None
+				  and batches_since_last_loss * global_batch_size >= loss_interval):
+					current_mean_loss = accum_loss_t / batches_since_last_loss
+					tracked_steps_t.append(step_counter)
+					tracked_losses_t.append(current_mean_loss)
+					chief_print("--- Train loss: {:.4f}".format(current_mean_loss))
+					WriteSummaryTrain(train_batch_loss, step_counter)
+					batches_since_last_loss = 0
+					accum_loss_t = 0.0
+					# TODO: hide metrics tracking into an object as well.
+
+				## new home for the validation block
+				if (loss_interval is not None
+				  and batches_since_last_valid * global_batch_size >= loss_interval):
+					#### validation block ####
+					# (not fully encapsulated yet)
+					valid_loss_this_epoch, \
+					min_valid_loss, min_valid_loss_epoch, \
+					evals_since_min_valid_loss = RunValidation(effective_epoch,
+					                                           step_counter)
+					# TODO: evals as in validation runs, not epochs!!!
+					if valid_loss_this_epoch <= min_valid_loss:
+						#min_valid_loss = valid_loss_this_epoch
+						#min_valid_loss_epoch = effective_epoch
+						min_valid_loss_step  = step_counter
+						if e > start_saving_from:
+							ae_weight_manager.save(autoencoder, effective_epoch,
+							                       update_best=True)
+					batches_since_last_valid = 0
+					#### end validation block ####
+
+			losses_t_steps += losses_t_batches
+			train_loss_this_epoch = np.average(losses_t_batches)
 			train_time = (datetime.now() - startTime).total_seconds()
 			train_times.append(train_time)
 			train_epochs.append(effective_epoch)
-			losses_t.append(train_loss_this_epoch)
 
-			if isChief:
-				with train_writer.as_default():
-					tf.summary.scalar("loss", train_loss_this_epoch,
- 					                  step=step_counter)
-					if lr_schedule:
-						tf.summary.scalar("learning_rate",
-						       optimizer._decayed_lr(var_dtype=tf.float32),
-						       step=step_counter)
-					else:
-						tf.summary.scalar("learning_rate", learning_rate,
-						                  step=step_counter)
-
-			chief_print("")
-			chief_print("Epoch: {}/{}...".format(effective_epoch, epochs+resume_from))
-			chief_print("--- Train loss: {:.4f}  time: {} ({})".format(
+			chief_print("--- Mean loss this epoch: {:.4f}  time: {} ({})".format(
 			          train_loss_this_epoch, train_time, datetime.now().time()))
 
-			if n_valid_samples > 0:
+			# TODO: write mean losses per epoch separately
+			#tracked_steps_t.append(step_counter)
+			#tracked_losses_t.append(train_loss_this_epoch)
 
-				startTime = datetime.now()
+			WriteSummaryTrain(train_loss_this_epoch, step_counter)
 
-				for batch_input_valid, batch_target_valid,\
-				    batch_orig_mask_valid, _, _ in dds_valid:
-					valid_loss_batch = compute_loss_distrib(autoencoder,
-					                                        loss_func,
-					                                        batch_input_valid,
-					                                        batch_target_valid,
-					                                        batch_orig_mask_valid)
-					losses_v_batches.append(valid_loss_batch)
-					batch_count_valid += 1
-					if max_batches is not None and batch_count_valid > max_batches:
-						break
-				valid_loss_this_epoch = np.average(losses_v_batches)
+			## validation block used to be here
 
-				valid_time = (datetime.now() - startTime).total_seconds()
-				losses_v.append(valid_loss_this_epoch)
-
-				if isChief:
-					with valid_writer.as_default():
-						tf.summary.scalar("loss", valid_loss_this_epoch,
-						                  step=step_counter)
-
-				if valid_loss_this_epoch <= min_valid_loss:
-					min_valid_loss = valid_loss_this_epoch
-					prev_min_val_loss_epoch = min_valid_loss_epoch
-					min_valid_loss_epoch = effective_epoch
-
-					if e > start_saving_from:
-						ae_weight_manager.save(autoencoder, effective_epoch,
-						                       update_best=True)
-
-				evals_since_min_valid_loss = effective_epoch - min_valid_loss_epoch
-				chief_print("--- Valid loss: {:.4f}  time: {} ({}) min loss: {:.4f} epochs since: {}".format(
-				       valid_loss_this_epoch, valid_time, datetime.now().time(),
-				       min_valid_loss, evals_since_min_valid_loss))
-
-				if evals_since_min_valid_loss >= patience:
-					break
+			if patience is not None and evals_since_min_valid_loss >= patience:
+				break
 
 			if e % save_interval == 0 and e > start_saving_from :
 				ae_weight_manager.save(autoencoder, effective_epoch)
@@ -1216,22 +1307,24 @@ if __name__ == "__main__":
 			write_metric_per_epoch_to_csv(outfilename, train_times, train_epochs)
 	
 			outfilename = os.path.join(train_directory, "losses_from_train_t.csv")
-			epochs_t_combined, losses_t_combined = write_metric_per_epoch_to_csv(outfilename, losses_t, train_epochs)
+			# TODO: this is not "per epoch" anymore
+			steps_t_combined, losses_t_combined = write_metric_per_epoch_to_csv(outfilename, losses_t_steps, all_steps)
 			fig, ax = plt.subplots()
-			plt.plot(epochs_t_combined, losses_t_combined, label="train", c="orange")
+			plt.plot(steps_t_combined, losses_t_combined, label="train", c="orange")
 	
 			if n_valid_samples > 0:
 				outfilename = os.path.join(train_directory, "losses_from_train_v.csv")
-				epochs_v_combined, losses_v_combined = write_metric_per_epoch_to_csv(outfilename, losses_v, train_epochs)
-				plt.plot(epochs_v_combined, losses_v_combined, label="valid", c="blue")
-				min_valid_loss_epoch = epochs_v_combined[np.argmin(losses_v_combined)]
-				plt.axvline(min_valid_loss_epoch, color="black")
-				plt.text(min_valid_loss_epoch + 0.1, 0.5,'min valid loss at epoch {}'.format(int(min_valid_loss_epoch)),
+				# TODO: this is not "per epoch" anymore
+				steps_v_combined, losses_v_combined = write_metric_per_epoch_to_csv(outfilename, tracked_losses_v, tracked_steps_v)
+				plt.plot(steps_v_combined, losses_v_combined, label="valid", c="blue")
+				min_valid_loss_point = steps_v_combined[np.argmin(losses_v_combined)]
+				plt.axvline(min_valid_loss_point, color="black")
+				plt.text(min_valid_loss_point + 0.1, 0.5,'min valid loss at step {}'.format(int(min_valid_loss_point)),
 						 rotation=90,
 						 transform=ax.get_xaxis_text1_transform(0)[0])
 	
-			plt.xlabel("Epoch")
-			plt.ylabel("Loss function value")
+			plt.xlabel("Steps")
+			plt.ylabel("Loss function value (running average)")
 			plt.legend()
 			plt.savefig(os.path.join(train_directory, "losses_from_train.pdf"))
 			plt.close()
