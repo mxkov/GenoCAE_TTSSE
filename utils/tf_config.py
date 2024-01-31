@@ -41,16 +41,25 @@ def parse_node_ids(nodes_str):
 	return node_ids
 
 
-def set_tf_config(port="8888"):
-
+def node_ids_from_nodelist():
 	nodelist_str = os.environ["SLURM_JOB_NODELIST"]
 	try:
-		clust = parse_node_ids(nodelist_str)
+		cluster = parse_node_ids(nodelist_str)
 	except BadNodelistException:
 		raise ValueError(f"Invalid SLURM_JOB_NODELIST value: {nodelist_str}")
+	return cluster
 
+
+def get_node_roles():
+	clust = node_ids_from_nodelist()
 	num_workers   = len(clust)
 	chief_node_id = clust[0]
+	return num_workers, chief_node_id
+
+
+def set_tf_config(port="8888"):
+
+	clust = node_ids_from_nodelist()
 
 	current_node_id    = os.environ["SLURMD_NODENAME"]
 	current_node_index = clust.index(current_node_id)
@@ -65,4 +74,4 @@ def set_tf_config(port="8888"):
 	}
 	os.environ["TF_CONFIG"] = json.dumps(tf_config)
 
-	return num_workers, chief_node_id
+	return tf_config

@@ -95,18 +95,15 @@ def test_dataset_format(f_filebase,
                         f_pref_chunk_size, f_shuffle_dataset):
 
 	GCAE_DIR = pathlib.Path(__file__).resolve().parents[2]
-	sys.path.append(str(GCAE_DIR)) # squash this into the latest commit
+	sys.path.append(str(GCAE_DIR))
 	from run_gcae import SlurmClusterResolver_fixed
 	sys.path.append(os.path.join(GCAE_DIR, 'utils'))
 	from data_handler_distrib import data_generator_distrib
-	from tf_config import set_tf_config
 
 	gpus = tf.config.list_physical_devices(device_type="GPU")
 	num_physical_gpus = len(gpus)
 
 	if "SLURMD_NODENAME" in os.environ:
-		#num_workers, _ = set_tf_config()
-		#resolver  = tfd.cluster_resolver.TFConfigClusterResolver()
 		resolver = SlurmClusterResolver_fixed(gpus_per_node=num_physical_gpus)
 		if num_physical_gpus > 0:
 			comm_impl = tfde.CommunicationImplementation.NCCL
