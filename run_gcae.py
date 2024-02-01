@@ -45,7 +45,7 @@ from datetime import datetime
 from utils.data_handler_distrib import data_generator_distrib # TODO: look into reimplementing all these below as well:
 from utils.data_handler import get_saved_epochs, get_projected_epochs, write_h5, read_h5, get_coords_by_pop, convex_hull_error, f1_score_kNN, plot_genotype_hist, to_genotypes_sigmoid_round, to_genotypes_invscale_round, GenotypeConcordance, get_pops_with_k, get_ind_pop_list_from_map, get_baseline_gc, write_metric_per_epoch_to_csv
 from utils.visualization import plot_coords_by_superpop, plot_clusters_by_superpop, plot_coords, plot_coords_by_pop, make_animation, write_f1_scores_to_csv
-from utils.tf_config import get_node_roles, define_distribution_strategy
+from utils.distrib_config import define_distribution_strategy
 import utils.visualization
 import utils.layers
 import json

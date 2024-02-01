@@ -97,7 +97,7 @@ def test_dataset_format(f_filebase,
 	GCAE_DIR = pathlib.Path(__file__).resolve().parents[2]
 	sys.path.append(os.path.join(GCAE_DIR, 'utils'))
 	from data_handler_distrib import data_generator_distrib
-	from tf_config import define_distribution_strategy
+	from distrib_config import define_distribution_strategy
 
 	strat, _, _ = define_distribution_strategy(multiworker_needed=True)
 
