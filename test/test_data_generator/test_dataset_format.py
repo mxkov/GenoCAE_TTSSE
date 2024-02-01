@@ -95,26 +95,11 @@ def test_dataset_format(f_filebase,
                         f_pref_chunk_size, f_shuffle_dataset):
 
 	GCAE_DIR = pathlib.Path(__file__).resolve().parents[2]
-	sys.path.append(str(GCAE_DIR))
-	from run_gcae import SlurmClusterResolver_fixed
 	sys.path.append(os.path.join(GCAE_DIR, 'utils'))
 	from data_handler_distrib import data_generator_distrib
+	from tf_config import define_distribution_strategy
 
-	gpus = tf.config.list_physical_devices(device_type="GPU")
-	num_physical_gpus = len(gpus)
-
-	if "SLURMD_NODENAME" in os.environ:
-		resolver = SlurmClusterResolver_fixed(gpus_per_node=num_physical_gpus)
-		if num_physical_gpus > 0:
-			comm_impl = tfde.CommunicationImplementation.NCCL
-		else:
-			comm_impl = tfde.CommunicationImplementation.RING
-		comm_opts = tfde.CommunicationOptions(implementation = comm_impl)
-		strat = tfd.MultiWorkerMirroredStrategy(cluster_resolver=resolver,
-		                                        communication_options=comm_opts)
-	else:
-		#num_workers = 1
-		strat = tfd.MirroredStrategy()
+	strat, _, _ = define_distribution_strategy(multiworker_needed=True)
 
 	num_devices = strat.num_replicas_in_sync
 	perreplica_batch_size = f_batch_size // num_devices
