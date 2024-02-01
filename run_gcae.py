@@ -701,9 +701,18 @@ if __name__ == "__main__":
 	regularizer = train_opts["regularizer"]
 
 	try:
-		max_batches = int(train_opts["max_batches"])
+		max_batches_train = int(train_opts["max_batches_train"])
+		# max _global_ batches:
+		max_batches_train = max_batches_train // num_devices
 	except:
-		max_batches = None
+		max_batches_train = None
+
+	try:
+		max_batches_valid = int(train_opts["max_batches_valid"])
+		# max _global_ batches:
+		max_batches_valid = max_batches_valid // num_devices
+	except:
+		max_batches_valid = None
 
 	superpopulations_file = arguments['superpops']
 	if superpopulations_file and not os.path.isabs(os.path.dirname(superpopulations_file)):
@@ -1025,7 +1034,7 @@ if __name__ == "__main__":
 		# valid losses per epoch
 		# ^ both gone. might re-add later
 		# train losses per step
-		losses_t_steps = []
+		losses_t_per_step = []
 		all_steps = []
 		
 		# min loss stats
@@ -1051,7 +1060,7 @@ if __name__ == "__main__":
 			if n_valid_samples <= 0:
 				return np.inf, np.inf, None, -1
 
-			losses_v_batches = []
+			losses_v_per_batch = []
 			batch_count_valid = 0
 			
 			startTime = datetime.now()
@@ -1063,11 +1072,12 @@ if __name__ == "__main__":
 				                                        batch_input_valid,
 				                                        batch_target_valid,
 				                                        batch_orig_mask_valid)
-				losses_v_batches.append(valid_loss_batch)
+				losses_v_per_batch.append(valid_loss_batch)
 				batch_count_valid += 1
-				if max_batches is not None and batch_count_valid > max_batches:
+				if (max_batches_valid is not None
+				  and batch_count_valid > max_batches_valid):
 					break
-			valid_loss_this_epoch_ = np.average(losses_v_batches)
+			valid_loss_this_eval_ = np.average(losses_v_per_batch)
 
 			valid_time = (datetime.now() - startTime).total_seconds()
 
@@ -1077,26 +1087,26 @@ if __name__ == "__main__":
 			min_valid_loss_epoch_ = min_valid_loss_epoch
 			min_valid_loss_step_  = min_valid_loss_step
 			# end danger zone 1
-			if valid_loss_this_epoch_ <= min_valid_loss_:
-				min_valid_loss_ = valid_loss_this_epoch_
+			if valid_loss_this_eval_ <= min_valid_loss_:
+				min_valid_loss_ = valid_loss_this_eval_
 				min_valid_loss_epoch_ = eff_epoch
 				min_valid_loss_step_ = step_count
 
 			#evals_since_min_valid_loss_ = eff_epoch - min_valid_loss_epoch_
 			evals_since_min_valid_loss_ = step_count - min_valid_loss_step_
 			timenow = datetime.now().time()
-			chief_print("--- Valid loss: {:.4f} ".format(valid_loss_this_epoch_) +
+			chief_print("--- Valid loss: {:.4f} ".format(valid_loss_this_eval_) +
 			           f" time: {valid_time} ({timenow})" +
 			            " min loss: {:.4f} ".format(min_valid_loss_) +
 			           f" steps since: {evals_since_min_valid_loss_}")
 
 			# danger zone 2: adding to outer-scope lists
 			tracked_steps_v.append(step_count)
-			tracked_losses_v.append(valid_loss_this_epoch_)
-			WriteSummaryValid(valid_loss_this_epoch_, step_count)
+			tracked_losses_v.append(valid_loss_this_eval_)
+			WriteSummaryValid(valid_loss_this_eval_, step_count)
 			# end danger zone 2
 
-			return valid_loss_this_epoch_, min_valid_loss_,\
+			return valid_loss_this_eval_, min_valid_loss_,\
 			       min_valid_loss_epoch_, evals_since_min_valid_loss_
 
 		######################################################
@@ -1110,7 +1120,7 @@ if __name__ == "__main__":
 			#       https://www.tensorflow.org/guide/profiler
 			startTime = datetime.now()
 			effective_epoch = e + resume_from
-			losses_t_batches = []
+			losses_t_per_batch = []
 			batch_count_train = 0
 
 			chief_print("\nEpoch: {}/{}...".format(effective_epoch, epochs+resume_from))
@@ -1122,18 +1132,16 @@ if __name__ == "__main__":
 				                                      optimizer, loss_func,
 				                                      batch_input, batch_target,
 				                                      batch_orig_mask)
-				losses_t_batches.append(train_batch_loss)
+				losses_t_per_batch.append(train_batch_loss)
 				batch_count_train += 1
-				if max_batches is not None and batch_count_train > max_batches:
-					break
 
 				# TODO: this averages losses over loss_interval.
 				#       could accumulate & average over all preceding batches instead.
 				accum_loss_t += train_batch_loss
 				batches_since_last_loss  += 1
 				batches_since_last_valid += 1
-				if (loss_interval is not None
-				  and batches_since_last_loss * global_batch_size >= loss_interval):
+				if (loss_interval is not None and
+				  batches_since_last_loss * global_batch_size >= loss_interval):
 					current_mean_loss = accum_loss_t / batches_since_last_loss
 					tracked_steps_t.append(step_counter)
 					tracked_losses_t.append(current_mean_loss)
@@ -1144,17 +1152,20 @@ if __name__ == "__main__":
 					# TODO: hide metrics tracking into an object as well.
 
 				## new home for the validation block
-				if (loss_interval is not None
-				  and batches_since_last_valid * global_batch_size >= loss_interval):
+				did_one_batch = (effective_epoch==1 and
+				                 batch_count_train==1)
+				if (loss_interval is not None and (
+				  batches_since_last_valid * global_batch_size >= loss_interval
+				  or did_one_batch)):
 					#### validation block ####
 					# (not fully encapsulated yet)
-					valid_loss_this_epoch, \
+					valid_loss_this_eval, \
 					min_valid_loss, min_valid_loss_epoch, \
 					evals_since_min_valid_loss = RunValidation(effective_epoch,
 					                                           step_counter)
 					# TODO: evals as in validation runs, not epochs!!!
-					if valid_loss_this_epoch <= min_valid_loss:
-						#min_valid_loss = valid_loss_this_epoch
+					if valid_loss_this_eval <= min_valid_loss:
+						#min_valid_loss = valid_loss_this_eval
 						#min_valid_loss_epoch = effective_epoch
 						min_valid_loss_step  = step_counter
 						if e > start_saving_from:
@@ -1163,8 +1174,12 @@ if __name__ == "__main__":
 					batches_since_last_valid = 0
 					#### end validation block ####
 
-			losses_t_steps += losses_t_batches
-			train_loss_this_epoch = np.average(losses_t_batches)
+				if (max_batches_train is not None
+				  and batch_count_train > max_batches_train):
+					break
+
+			losses_t_per_step += losses_t_per_batch
+			train_loss_this_epoch = np.average(losses_t_per_batch)
 			train_time = (datetime.now() - startTime).total_seconds()
 			train_times.append(train_time)
 			train_epochs.append(effective_epoch)
@@ -1194,7 +1209,7 @@ if __name__ == "__main__":
 	
 			outfilename = os.path.join(train_directory, "losses_from_train_t.csv")
 			# TODO: this is not "per epoch" anymore
-			steps_t_combined, losses_t_combined = write_metric_per_epoch_to_csv(outfilename, losses_t_steps, all_steps)
+			steps_t_combined, losses_t_combined = write_metric_per_epoch_to_csv(outfilename, losses_t_per_step, all_steps)
 			fig, ax = plt.subplots()
 			plt.plot(steps_t_combined, losses_t_combined, label="train", c="orange")
 	
