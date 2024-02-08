@@ -47,6 +47,7 @@ def pytest_generate_tests(metafunc):
 
 	# TODO: add more toy examples, incl. incorrect ones
 	# TODO: check empty batches (they mess up mask shape)
+	# TODO: generate fixtures based on context? e.g. number of workers/devices
 	fixt_params = {
 		"f_filebase"         : [os.path.join("example_tiny", "parquet",
 		                                     "HumanOrigins249_tiny")],
