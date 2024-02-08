@@ -5,6 +5,8 @@ import tensorflow.distribute as tfd
 import tensorflow.distribute.experimental as tfde
 from tensorflow.python.training.server_lib import ClusterSpec
 
+LOCAL_WORKER_ID = "localnode"
+
 
 class SlurmClusterResolver_fixed(tfd.cluster_resolver.SlurmClusterResolver):
 	"""Child of tf.distribute.cluster_resolver.SlurmClusterResolver
@@ -79,18 +81,18 @@ class BadNodelistException(Exception):
 		super().__init__()
 
 
-def parse_node_ids(nodes_str):
+def node_ids_from_nodelist(nodelist_str):
 
-	if nodes_str.find("[") == -1:
-		return [nodes_str]
+	if nodelist_str.find("[") == -1:
+		return [nodelist_str]
 
-	i1 = nodes_str.find("[")+1
-	i2 = nodes_str.find("]")
+	i1 = nodelist_str.find("[")+1
+	i2 = nodelist_str.find("]")
 	if i2 == -1:
 		raise BadNodelistException()
-	node_nums_str = nodes_str[i1:i2]
-	prefix        = nodes_str[:i1-1]
-	suffix        = nodes_str[i2+1:]
+	node_nums_str = nodelist_str[i1:i2]
+	prefix        = nodelist_str[:i1-1]
+	suffix        = nodelist_str[i2+1:]
 
 	node_ids = []
 
@@ -114,17 +116,25 @@ def parse_node_ids(nodes_str):
 	return node_ids
 
 
-def node_ids_from_nodelist():
-	nodelist_str = os.environ["SLURM_JOB_NODELIST"]
+def get_node_ids():
+	if "SLURM_JOB_NODELIST" not in os.environ:
+		return [LOCAL_WORKER_ID]
+	nodes_str = os.environ["SLURM_JOB_NODELIST"]
 	try:
-		cluster = parse_node_ids(nodelist_str)
+		cluster = node_ids_from_nodelist(nodes_str)
 	except BadNodelistException:
-		raise ValueError(f"Invalid SLURM_JOB_NODELIST value: {nodelist_str}")
+		raise ValueError(f"Invalid SLURM_JOB_NODELIST value: {nodes_str}")
 	return cluster
 
 
+def get_worker_id():
+	if "SLURMD_NODENAME" in os.environ:
+		return os.environ["SLURMD_NODENAME"]
+	return LOCAL_WORKER_ID
+
+
 def get_node_roles():
-	clust = node_ids_from_nodelist()
+	clust = get_node_ids()
 	n_workers   = len(clust)
 	chief_node_id = clust[0]
 	return n_workers, chief_node_id
@@ -132,9 +142,9 @@ def get_node_roles():
 
 def set_tf_config(port="8888"):
 
-	clust = node_ids_from_nodelist()
+	clust = get_node_ids()
 
-	current_node_id    = os.environ["SLURMD_NODENAME"]
+	current_node_id    = get_worker_id()
 	current_node_index = clust.index(current_node_id)
 	current_node_role  = "worker"
 
@@ -151,8 +161,8 @@ def set_tf_config(port="8888"):
 
 
 def set_cluster_env(num_gpus):
-	if "CLUSTER" in os.environ:
-		cluster_name = os.environ["CLUSTER"]
+	if "SLURM_CLUSTER_NAME" in os.environ:
+		cluster_name = os.environ["SLURM_CLUSTER_NAME"]
 	else:
 		cluster_name = "local"
 
@@ -172,18 +182,18 @@ def define_distribution_strategy(multiworker_needed=True):
 	#       pretty sure TF makes that assumption as well.
 
 	gpus = tf.config.list_physical_devices(device_type="GPU")
-	print("Available GPU devices:\n{}".format(gpus))
 	num_physical_gpus = len(gpus)
 	gpus = ["gpu:"+ str(i) for i in range(num_physical_gpus)]
+
+	set_cluster_env(num_physical_gpus)
 
 	terminate_worker = False
 
 	if "SLURMD_NODENAME" in os.environ:
 
 		n_workers, chief_id = get_node_roles()
-		isChief = os.environ["SLURMD_NODENAME"] == chief_id
-
-		set_cluster_env(num_physical_gpus)
+		worker_id = get_worker_id()
+		isChief = worker_id==chief_id
 
 		if n_workers > 1 and multiworker_needed:
 			#resolver = tfd.cluster_resolver.TFConfigClusterResolver()
