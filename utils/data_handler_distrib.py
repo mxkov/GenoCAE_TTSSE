@@ -9,10 +9,31 @@ import pyarrow.parquet as pq
 import re
 import scipy
 import tensorflow as tf
+from datetime import datetime
 
 # TODO: backwards compatibility with PLINK / EIGENSTRAT
 # TODO: also, doesn't make sense to convert to tfrecords if you only want to project.
 #       feed a `training` arg to create_tf_dataset and add an option to skip that.
+
+class DebugReport:
+
+	def __init__(self):
+		self._report = ""
+
+	def add(self, addition):
+		try:
+			self._report += str(addition)
+		except:
+			pass
+
+	def write(self, filename, directory="ae_reports", mode="w"):
+		if mode not in ("w", "a"):
+			mode = "w"
+		os.makedirs(directory, exist_ok=True)
+		f = open(os.path.join(directory, filename), mode)
+		f.write(self._report)
+		f.close()
+
 
 @dataclass
 class data_generator_distrib:
@@ -23,6 +44,7 @@ class data_generator_distrib:
 	drop_inds_file:        str  = None
 	geno_dtype:            type = np.float32
 	missing_mask:          bool = True
+	_debug:                bool = False
 	# Validation options
 	valid_split:           float= 0.2
 	valid_random_state:    int  = None
@@ -42,9 +64,13 @@ class data_generator_distrib:
 
 	def __post_init__(self):
 		self.missing_val  = self.normalization_options["missing_val"]
+		self.chunk_size   = None
 		self.total_chunks = None
 		self.filelist = []
 		self.samples_per_file = dict()
+
+		if self._debug:
+			self.debug_report = DebugReport()
 
 		self._get_ind_pop_list()
 		self._get_n_markers()
@@ -75,6 +101,9 @@ class data_generator_distrib:
 			raise FileNotFoundError("No FAM files found that fit " +
 			                       f"the pattern {self.filebase}*.fam")
 
+		if self._debug:
+			self.debug_report.add("\nFAM files:\n"+"\n".join(fam_files)+"\n")
+
 		for fam_file in fam_files:
 			pq_file = re.sub(".fam$", ".parquet", fam_file)
 			if not os.path.isfile(pq_file):
@@ -93,6 +122,9 @@ class data_generator_distrib:
 
 		if self.ind_pop_list.shape[0] == 0:
 			raise IOError(f"No samples found in FAM files {self.filebase}*.fam")
+
+		if self._debug:
+			self.debug_report.add(f"\nPQ filelist: {self.filelist}\n")
 
 
 	def _get_n_markers(self):
@@ -203,6 +235,14 @@ class data_generator_distrib:
 
 		ds = tf.data.Dataset.from_tensor_slices(pq_paths)
 		ds = ds.shard(num_workers, worker_id)
+
+		if self._debug:
+			self.debug_report.add(f"\nPQ paths to be sharded: {pq_paths}\n")
+			self.debug_report.add(f"num_workers: {num_workers}\n"+
+			                      f"worker_id: {worker_id}\n"+
+			                      f"Sharded PQ paths:\n"+
+			                      "\n".join([str(elem) for elem in ds])+"\n")
+
 		ds = ds.interleave(ds_from_pq_generator,
 		                   num_parallel_calls=tf.data.AUTOTUNE,
 		                   cycle_length=num_workers, block_length=1)
@@ -210,6 +250,10 @@ class data_generator_distrib:
 		ds = ds.map(self._normalize, num_parallel_calls=tf.data.AUTOTUNE)
 		ds = ds.map(self._mask_and_sparsify,
 		            num_parallel_calls=tf.data.AUTOTUNE)
+
+		if self._debug:
+			self.debug_report.write()
+
 		return ds
 
 
@@ -262,6 +306,17 @@ class data_generator_distrib:
 		# https://www.tensorflow.org/guide/data
 		# https://stackoverflow.com/q/68164440
 
+		if self._debug:
+			try:
+				jid = os.environ["SLURM_JOB_ID"]
+				wid = os.environ["SLURMD_NODENAME"]
+			except:
+				jid = "localjob"
+				wid = "localnode"
+			pqreport = DebugReport()
+			pqreport.add(f"\nOpening on worker {wid} at {datetime.now().time()}:"+
+			             f" {filepaths}\n")
+
 		if type(filepaths) == list and type(filepaths[0]) == bytes:
 			filepaths = [f.decode() for f in filepaths]
 		elif type(filepaths) == bytes:
@@ -285,6 +340,12 @@ class data_generator_distrib:
 		                                 for f in filepaths], axis=0)
 		cur_ind_pop_list = np.copy(self.ind_pop_list[cur_sample_idx,:])
 
+		if self._debug:
+			report_idx = {}
+			report_idx["allsample"] = np.concatenate([cur_sample_idx_per_file[f]
+			                               for f in self.filelist], axis=0)
+			report_idx["cursample"] = np.copy(cur_sample_idx)
+
 		# TODO: make sure to properly support multiple files, everywhere
 		int32_t_MAX = 2**31-1
 		pqds = pq.ParquetDataset(path_or_paths = filepaths,
@@ -307,9 +368,21 @@ class data_generator_distrib:
 		n_samples = len(cur_sample_idx)
 
 		chunk_size = pref_chunk_size_ - pref_chunk_size_ % gen_batch_size
+		self.chunk_size = chunk_size
 		self.total_chunks = np.ceil(n_samples / chunk_size).astype(int)
 
+		if self._debug:
+			for idx_id in ("allsample", "cursample"):
+				rep = DebugReport()
+				rep.add("\n".join([str(idx) for idx in report_idx[idx_id]]))
+				rep.write(f"slurm-{jid}_{wid}_{idx_id}idx_{split_}.txt")
+			pqreport += (f"N samples: {n_samples}\n"+
+			             f"Final chunks size: {self.chunk_size}\n"+
+			             f"Total chunks: {self.total_chunks}\n")
+
 		chunks_read = 0
+		total_sample_count = 0
+		total_batch_count = 0
 		while chunks_read < self.total_chunks:
 
 			start = chunk_size * chunks_read
@@ -346,9 +419,18 @@ class data_generator_distrib:
 					last_batch_in_chunk = True
 
 				batches_read += 1
+				total_batch_count += 1
+				total_sample_count += batch_genos.shape[0]
 
 				yield batch_genos, batch_indpop, \
 				      batch_genos.shape, np.array([last_batch_in_chunk])
+
+		if self._debug:
+			fname = filepaths[0].split("/")[-1].replace(".parquet", "")
+			pqreport.add(f"Finished at {datetime.now().time()}.\n"+
+			             f"Total batches read: {total_batch_count}\n"+
+			             f"Total samples read: {total_sample_count}\n")
+			pqreport.write(f"slurm-{jid}_{wid}_{split_}_{fname}.txt", mode="a")
 
 
 	def _normalize(self, genos, indpop, genos_shape, *args):
