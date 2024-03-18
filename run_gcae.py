@@ -350,8 +350,8 @@ def run_optimization(model, optimizer, loss_function,
 	gradients = g.gradient(loss_value, model.trainable_variables)
 
 	optimizer.apply_gradients(zip(gradients, model.trainable_variables),
-	                         #skip_gradients_aggregation=True)        # new Adam
-	                          experimental_aggregate_gradients=False) # legacy Adam
+	                         #skip_gradients_aggregation=False)      # new Adam
+	                          experimental_aggregate_gradients=True) # legacy Adam
 	# TODO: "If true, gradients aggregation will not be performed inside optimizer.
 	#        Usually this arg is set to True when you write custom code
 	#        aggregating gradients outside the optimizer. "
@@ -933,7 +933,9 @@ if __name__ == "__main__":
 		save_epochs  = []
 
 		############### setup learning rate schedule ##############
-		step_counter = resume_from * n_train_batches
+		#step_counter = resume_from * n_train_batches
+		step_counter = resume_from * 930
+		# ^ crutch for until the incomplete batches are fixed
 		if "lr_scheme" in train_opts.keys():
 			schedule_module = getattr(eval(train_opts["lr_scheme"]["module"]), train_opts["lr_scheme"]["class"])
 			schedule_args = train_opts["lr_scheme"]["args"]
@@ -1012,8 +1014,8 @@ if __name__ == "__main__":
 			# This initializes the variables used by the optimizers,
 			# as well as any stateful metric variables
 			_ = train_step_distrib(autoencoder, optimizer, loss_func,
-			                       input_init[0,:], targets_init[0,:],
-			                       orig_mask_init[0,:])
+			                       input_init[:1,:], targets_init[:1,:],
+			                       orig_mask_init[:1,:])
 			with strat.scope():
 				autoencoder.load_weights(weights_file_prefix)
 
@@ -1080,7 +1082,7 @@ if __name__ == "__main__":
 		#       e.g. min_valid_loss_epoch.
 		#       and also appends to lists from the outer scope, e.g. losses_v.
 		#       gotta tuck those loose ends in somehow. callback?
-		def RunValidation(eff_epoch, step_count):
+		def run_validation(eff_epoch, step_count):
 			if n_valid_samples <= 0:
 				return np.inf, np.inf, None, -1
 
@@ -1137,6 +1139,7 @@ if __name__ == "__main__":
 
 		chief_print(f"\nTraining start: {datetime.now().time()}")
 		chief_print(f"Step count: {step_counter}")
+		chief_print(f"Train samples: {n_train_samples}")
 		chief_print(f"Valid samples: {n_valid_samples}")
 
 		for e in range(1,epochs+1):
@@ -1185,8 +1188,8 @@ if __name__ == "__main__":
 					# (not fully encapsulated yet)
 					valid_loss_this_eval, \
 					min_valid_loss, min_valid_loss_epoch, \
-					evals_since_min_valid_loss = RunValidation(effective_epoch,
-					                                           step_counter)
+					evals_since_min_valid_loss = run_validation(effective_epoch,
+					                                            step_counter)
 					# TODO: evals as in validation runs, not epochs!!!
 					if valid_loss_this_eval <= min_valid_loss:
 						#min_valid_loss = valid_loss_this_eval
@@ -1201,6 +1204,22 @@ if __name__ == "__main__":
 				if (max_batches_train is not None
 				  and batch_count_train > max_batches_train):
 					break
+
+			# one more validation block
+			# (i want a callback instead :c)
+			if batches_since_last_valid > 5:
+				#### validation block ####
+				valid_loss_this_eval, \
+				min_valid_loss, min_valid_loss_epoch, \
+				evals_since_min_valid_loss = run_validation(effective_epoch,
+				                                            step_counter)
+				if valid_loss_this_eval <= min_valid_loss:
+					min_valid_loss_step  = step_counter
+					if e > start_saving_from:
+						ae_weight_manager.save(autoencoder, effective_epoch,
+						                       update_best=True)
+				batches_since_last_valid = 0
+				#### end validation block ####
 
 			losses_t_per_step += losses_t_per_batch
 			train_loss_this_epoch = np.average(losses_t_per_batch)
@@ -1249,13 +1268,13 @@ if __name__ == "__main__":
 						 transform=ax.get_xaxis_text1_transform(0)[0])
 	
 			plt.xlabel("Steps")
-			plt.ylabel("Loss function value (running average)")
+			plt.ylabel("Loss function value")
 			plt.legend()
 			plt.savefig(os.path.join(train_directory, "losses_from_train.pdf"))
 			plt.close()
 
 		chief_print("Done training at {0}. Wrote to {1}".format(
-	             datetime.now().time(), train_directory))
+		            datetime.now().time(), train_directory))
 		ae_weight_manager.cleanup()
 
 	if arguments['project']:
