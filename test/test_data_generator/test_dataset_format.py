@@ -8,7 +8,7 @@ from tensorflow.python.distribute.values import PerReplica
 
 GCAE_DIR = pathlib.Path(__file__).resolve().parents[2]
 sys.path.append(os.path.join(GCAE_DIR, 'utils'))
-from data_handler_distrib import data_generator_distrib
+from data_handler_distrib import DataGenerator
 from distrib_config import get_node_ids, get_worker_id, get_node_roles, define_distribution_strategy
 
 
@@ -195,7 +195,7 @@ def test_dataset_format(f_filebase,
 		"batch_shards"         : False,
 		"shuffle_dataset"      : f_shuffle_dataset
 	}
-	dg = data_generator_distrib(**dg_args)
+	dg = DataGenerator(**dg_args)
 
 	#batch_size_per_replica = 1
 	#total_batches = dg.n_train_samples // batch_size_per_replica

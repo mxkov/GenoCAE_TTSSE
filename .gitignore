@@ -1,14 +1,26 @@
-# Singularity containers (too big)
+# Apptainer containers (too big)
 *.sif
-# Singularity logs, build files w/o Tensorflow, etc.
-singularity/*
-!singularity/build.def
+# Apptainer logs, experimental build files, etc.
+apptainer/*
+!apptainer/build.def
 
 # Python cache
 *__pycache__
 
 # Output dirs
-ae_out*
+ae_*
+# Logs
+slurm*
+
+# Plots
+*.svg
 
 # Other
 .vscode/
+example_tiny/parquet/files.csv
+runs/
+tools/
+run_gcae_*
+train_opts/ex4*
+train_opts/ex5*
+vis.py

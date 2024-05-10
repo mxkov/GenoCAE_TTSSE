@@ -42,7 +42,7 @@ import tensorflow.distribute.experimental as tfde
 from tensorflow.keras import Model, layers
 from tensorflow.python.distribute.values import PerReplica
 from datetime import datetime
-from utils.data_handler_distrib import data_generator_distrib # TODO: look into reimplementing all these below as well:
+from utils.data_handler_distrib import DataGenerator # TODO: look into reimplementing all these below as well:
 from utils.data_handler import get_saved_epochs, get_projected_epochs, write_h5, read_h5, get_coords_by_pop, convex_hull_error, f1_score_kNN, plot_genotype_hist, to_genotypes_sigmoid_round, to_genotypes_invscale_round, GenotypeConcordance, get_pops_with_k, get_ind_pop_list_from_map, get_baseline_gc, write_metric_per_epoch_to_csv
 from utils.visualization import plot_coords_by_superpop, plot_clusters_by_superpop, plot_coords, plot_coords_by_pop, make_animation, write_f1_scores_to_csv
 from utils.distrib_config import define_distribution_strategy
@@ -887,7 +887,7 @@ if __name__ == "__main__":
 		           "sparsifies"           : sparsifies,
 		           "pref_chunk_size"      : None, # auto
 		           "shuffle_dataset"      : True}
-		dg = data_generator_distrib(**dg_args)
+		dg = DataGenerator(**dg_args)
 		n_markers = copy.deepcopy(dg.n_markers)
 
 		# dds stands for tfd.DistributedDataset
@@ -934,7 +934,9 @@ if __name__ == "__main__":
 
 		############### setup learning rate schedule ##############
 		#step_counter = resume_from * n_train_batches
-		step_counter = resume_from * 930
+		#step_counter = resume_from * 930  # valid every 10k
+		step_counter = resume_from * 1665  # valid every 100k
+		step_counter = resume_from * 2990  # full epoch with global batch size 160
 		# ^ crutch for until the incomplete batches are fixed
 		if "lr_scheme" in train_opts.keys():
 			schedule_module = getattr(eval(train_opts["lr_scheme"]["module"]), train_opts["lr_scheme"]["class"])
@@ -1162,13 +1164,19 @@ if __name__ == "__main__":
 				losses_t_per_batch.append(train_batch_loss)
 				batch_count_train += 1
 
-				# TODO: this averages losses over loss_interval.
-				#       could accumulate & average over all preceding batches instead.
-				accum_loss_t += train_batch_loss
+				did_one_batch = (effective_epoch==1 and
+				                 batch_count_train==1)
 				batches_since_last_loss  += 1
 				batches_since_last_valid += 1
-				if (loss_interval is not None and
-				  batches_since_last_loss * global_batch_size >= loss_interval):
+
+				accum_loss_t += train_batch_loss
+
+				# TODO: this averages losses over loss_interval.
+				#       could accumulate & average over all preceding batches instead.
+
+				if (loss_interval is not None and (
+				  batches_since_last_loss * global_batch_size >= loss_interval
+				  or did_one_batch)):
 					current_mean_loss = accum_loss_t / batches_since_last_loss
 					tracked_steps_t.append(step_counter)
 					tracked_losses_t.append(current_mean_loss)
@@ -1179,8 +1187,6 @@ if __name__ == "__main__":
 					# TODO: hide metrics tracking into an object as well.
 
 				## new home for the validation block
-				did_one_batch = (effective_epoch==1 and
-				                 batch_count_train==1)
 				if (loss_interval is not None and (
 				  batches_since_last_valid * global_batch_size >= loss_interval
 				  or did_one_batch)):
@@ -1314,7 +1320,7 @@ if __name__ == "__main__":
 		           "sparsifies"           : [0.0],
 		           "pref_chunk_size"      : None, # auto
 		           "shuffle_dataset"      : False}
-		dg = data_generator_distrib(**dg_args)
+		dg = DataGenerator(**dg_args)
 		n_markers = copy.deepcopy(dg.n_markers)
 		n_unique_samples = copy.deepcopy(dg.n_total_samples)
 

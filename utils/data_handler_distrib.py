@@ -36,7 +36,7 @@ class DebugReport:
 
 
 @dataclass
-class data_generator_distrib:
+class DataGenerator:
 	"""docstring""" # TODO: DOCS & comments
 	filebase:              str
 	global_batch_size:     int
@@ -205,7 +205,7 @@ class data_generator_distrib:
 			self.pref_chunk_size = auto_chunk_size(width=self.n_markers,
 			                                       dtype=self.geno_dtype)
 
-		def ds_from_pq_generator(files):
+		def pq_generator_wrapper(files):
 			gen_outshapes = (
 				# genotypes
 				tf.TensorSpec(shape=(None, self.n_markers),
@@ -227,6 +227,7 @@ class data_generator_distrib:
 		num_workers = input_context.num_input_pipelines
 		worker_id   = input_context.input_pipeline_id
 		batch_size  = input_context.get_per_replica_batch_size(self.global_batch_size)
+		num_devices = input_context.num_replicas_in_sync
 
 		pq_paths = self.filelist
 		if len(pq_paths) % num_workers != 0:
@@ -243,16 +244,19 @@ class data_generator_distrib:
 			                      f"Sharded PQ paths:\n"+
 			                      "\n".join([str(elem) for elem in ds])+"\n")
 
-		ds = ds.interleave(ds_from_pq_generator,
+		ds = ds.interleave(pq_generator_wrapper,
 		                   num_parallel_calls=tf.data.AUTOTUNE,
-		                   cycle_length=num_workers, block_length=1)
+		                   cycle_length=tf.data.AUTOTUNE,
+		                   block_length=1)
+		# cycle_length is how many files are worked concurrently ON THIS WORKER.
+		# source: debug reports.
 		ds = ds.prefetch(tf.data.AUTOTUNE)
 		ds = ds.map(self._normalize, num_parallel_calls=tf.data.AUTOTUNE)
 		ds = ds.map(self._mask_and_sparsify,
 		            num_parallel_calls=tf.data.AUTOTUNE)
 
 		if self._debug:
-			self.debug_report.write()
+			self.debug_report.write("general.txt")
 
 		return ds
 
@@ -306,17 +310,6 @@ class data_generator_distrib:
 		# https://www.tensorflow.org/guide/data
 		# https://stackoverflow.com/q/68164440
 
-		if self._debug:
-			try:
-				jid = os.environ["SLURM_JOB_ID"]
-				wid = os.environ["SLURMD_NODENAME"]
-			except:
-				jid = "localjob"
-				wid = "localnode"
-			pqreport = DebugReport()
-			pqreport.add(f"\nOpening on worker {wid} at {datetime.now().time()}:"+
-			             f" {filepaths}\n")
-
 		if type(filepaths) == list and type(filepaths[0]) == bytes:
 			filepaths = [f.decode() for f in filepaths]
 		elif type(filepaths) == bytes:
@@ -341,10 +334,18 @@ class data_generator_distrib:
 		cur_ind_pop_list = np.copy(self.ind_pop_list[cur_sample_idx,:])
 
 		if self._debug:
-			report_idx = {}
-			report_idx["allsample"] = np.concatenate([cur_sample_idx_per_file[f]
-			                               for f in self.filelist], axis=0)
-			report_idx["cursample"] = np.copy(cur_sample_idx)
+			try:
+				jid = os.environ["SLURM_JOB_ID"]
+				wid = os.environ["SLURMD_NODENAME"]
+			except:
+				jid = "localjob"
+				wid = "localnode"
+			fname = re.sub(".parquet$", "", pathlib.Path(filepaths[0]).name)
+			pqreport_file = f"slurm-{jid}_{wid}_{split_}_{fname}.txt"
+			pqreport = DebugReport()
+			pqreport.add(f"\nOpening on worker {wid} at {datetime.now().time()}:"+
+			             f" {filepaths}\n")
+			pqreport.write(pqreport_file, mode="a")
 
 		# TODO: make sure to properly support multiple files, everywhere
 		int32_t_MAX = 2**31-1
@@ -372,13 +373,10 @@ class data_generator_distrib:
 		self.total_chunks = np.ceil(n_samples / chunk_size).astype(int)
 
 		if self._debug:
-			for idx_id in ("allsample", "cursample"):
-				rep = DebugReport()
-				rep.add("\n".join([str(idx) for idx in report_idx[idx_id]]))
-				rep.write(f"slurm-{jid}_{wid}_{idx_id}idx_{split_}.txt")
-			pqreport += (f"N samples: {n_samples}\n"+
+			pqreport.add(f"N samples: {n_samples}\n"+
 			             f"Final chunks size: {self.chunk_size}\n"+
 			             f"Total chunks: {self.total_chunks}\n")
+			pqreport.write(pqreport_file, mode="a")
 
 		chunks_read = 0
 		total_sample_count = 0
@@ -391,6 +389,7 @@ class data_generator_distrib:
 			# Last chunk does not necessarily contain chunk_size samples!
 
 			chunk_indpop = self.ind_pop_list[chunk_idx,:]
+			# chunk_indpop = cur_ind_pop_list[chunk_idx,:] -??
 			inds_to_read = list(chunk_indpop[:,0])
 			chunk = pqds.read(columns = inds_to_read,
 			                  use_threads = True,  # TODO: try without
@@ -426,11 +425,10 @@ class data_generator_distrib:
 				      batch_genos.shape, np.array([last_batch_in_chunk])
 
 		if self._debug:
-			fname = filepaths[0].split("/")[-1].replace(".parquet", "")
 			pqreport.add(f"Finished at {datetime.now().time()}.\n"+
 			             f"Total batches read: {total_batch_count}\n"+
 			             f"Total samples read: {total_sample_count}\n")
-			pqreport.write(f"slurm-{jid}_{wid}_{split_}_{fname}.txt", mode="a")
+			pqreport.write(pqreport_file, mode="a")
 
 
 	def _normalize(self, genos, indpop, genos_shape, *args):
