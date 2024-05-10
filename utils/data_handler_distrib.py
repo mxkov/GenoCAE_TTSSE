@@ -35,6 +35,28 @@ class DebugReport:
 		f.close()
 
 
+int32_t_MAX = 2**31-1
+
+def open_parquets(filepaths, inds_fam=None, exact_check=False):
+	pqds = pq.ParquetDataset(path_or_paths = filepaths,
+	                         thrift_string_size_limit = int32_t_MAX,
+	                         thrift_container_size_limit = int32_t_MAX,
+	                         use_legacy_dataset = False)
+	if inds_fam is None:  # no check
+		return pqds
+	inds_sch = np.array([entry.name for entry in pqds.schema])
+	if exact_check:
+		fail_cond = ((len(inds_sch) != len(inds_fam)) or
+		             (inds_sch != inds_fam).any())
+	else:
+		present_in_pq  = np.in1d(inds_fam, inds_sch, invert=False)
+		present_in_fam = np.in1d(inds_sch, inds_fam, invert=False)
+		fail_cond = (inds_sch[present_in_fam] != inds_fam[present_in_pq]).any()
+	if fail_cond:
+		raise ValueError("Parquet schema inconsistent with FAM files")
+	return pqds
+
+
 @dataclass
 class DataGenerator:
 	"""docstring""" # TODO: DOCS & comments
@@ -347,22 +369,8 @@ class DataGenerator:
 			             f" {filepaths}\n")
 			pqreport.write(pqreport_file, mode="a")
 
-		# TODO: make sure to properly support multiple files, everywhere
-		int32_t_MAX = 2**31-1
-		pqds = pq.ParquetDataset(path_or_paths = filepaths,
-		                         thrift_string_size_limit = int32_t_MAX,
-		                         thrift_container_size_limit = int32_t_MAX,
-		                         use_legacy_dataset = False)
-		# OBS! might not preserve column order. rely on schema instead.
-		inds_sch = np.array([entry.name for entry in pqds.schema])
-		inds_fam = cur_ind_pop_list[:,0]
-		present_in_pq  = np.in1d(inds_fam, inds_sch, invert=False)
-		present_in_fam = np.in1d(inds_sch, inds_fam, invert=False)
-		# TODO: this check might need a rework.
-		if (inds_sch[present_in_fam] != inds_fam[present_in_pq]).any():
-			raise ValueError("Parquet schema inconsistent with FAM files")
+		pqds = open_parquets(filepaths, inds_fam = cur_ind_pop_list[:,0])
 
-		assert (cur_sample_idx[present_in_pq] == cur_sample_idx).all()
 		cur_sample_idx = tf.cast(cur_sample_idx, tf.int32)
 		if shuffle_:
 			cur_sample_idx = tf.random.shuffle(cur_sample_idx)
