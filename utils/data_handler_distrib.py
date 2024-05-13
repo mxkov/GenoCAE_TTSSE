@@ -602,36 +602,35 @@ class DataGenerator:
 
 		sparsify = False
 		if len(self.sparsifies) > 0:
-			sparsify_fraction = np.random.choice(self.sparsifies)
+			# DO NOT use numpy in what's gonna be graph-traced!! only TF
+			sparsify_fraction = tf.random.shuffle(self.sparsifies)[0]
 			if sparsify_fraction > 0.0:
 				sparsify = True
 
+		mask = tf.fill(genos_shape, 1)
+
 		if not sparsify and not self.missing_mask:
 			inputs = tf.expand_dims(genos, axis=-1)
-			return inputs, genos, indpop
+			mask   = tf.cast(mask, tf.bool)
+			return inputs, genos, mask, indpop, *args
+			# this branch should return the same number of elements
+			# as the main body.
+			# esp bc self.sparsifies may contain both zeros and non-zeros.
 
 		inputs = tf.identity(genos)
-		mask   = tf.cast(tf.fill(genos_shape, 1), tf.as_dtype(self.geno_dtype))
+		mask   = tf.cast(mask, tf.as_dtype(self.geno_dtype))
 		if self.impute_missing:
 			orig_mask = tf.identity(mask)
 		else:
-			where_nonmissing = tf.where(genos != self.missing_val)
-			delta_m = tf.repeat(1, tf.shape(where_nonmissing)[0])
-			delta_m = tf.sparse.SparseTensor(indices=where_nonmissing,
-			                                 values=delta_m,
-			                                 dense_shape=genos_shape)
-			delta_m = tf.sparse.to_dense(tf.cast(delta_m, mask.dtype))
+			delta_m = tf.where(genos != self.missing_val, 1., 0.)
+			delta_m = tf.cast(delta_m, mask.dtype)
 			orig_mask = delta_m
 
 		if sparsify:
 			probs = tf.random.uniform(shape=genos_shape, minval=0, maxval=1)
-			where_sparse = tf.where(probs < sparsify_fraction)
-			delta_s = tf.repeat(-1, tf.shape(where_sparse)[0])
-			delta_s = tf.sparse.SparseTensor(indices=where_sparse,
-			                                 values=delta_s,
-			                                 dense_shape=genos_shape)
+			delta_s = tf.where(probs < sparsify_fraction, -1., 0.)
 			delta_s = tf.cast(delta_s, mask.dtype)
-			mask = tf.sparse.add(mask, delta_s)
+			mask = tf.math.add(mask, delta_s)
 			inputs = tf.math.add(tf.math.multiply(inputs, mask),
 			                     self.missing_val*(1-mask))
 
