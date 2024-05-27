@@ -42,8 +42,9 @@ import tensorflow.distribute.experimental as tfde
 from tensorflow.keras import Model, layers
 from tensorflow.python.distribute.values import PerReplica
 from datetime import datetime
-from utils.data_handler_distrib import DataGenerator # TODO: look into reimplementing all these below as well:
-from utils.data_handler import get_saved_epochs, get_projected_epochs, write_h5, read_h5, get_coords_by_pop, convex_hull_error, f1_score_kNN, plot_genotype_hist, to_genotypes_sigmoid_round, to_genotypes_invscale_round, GenotypeConcordance, get_pops_with_k, get_ind_pop_list_from_map, get_baseline_gc, write_metric_per_epoch_to_csv
+from utils.data_handler_distrib import DataGenerator, GenotypeConcordance
+# TODO: look into reimplementing all these below as well:
+from utils.data_handler import get_saved_epochs, get_projected_epochs, write_h5, read_h5, get_coords_by_pop, convex_hull_error, f1_score_kNN, plot_genotype_hist, to_genotypes_sigmoid_round, to_genotypes_invscale_round, get_pops_with_k, get_ind_pop_list_from_map, get_baseline_gc, write_metric_per_epoch_to_csv
 from utils.visualization import plot_coords_by_superpop, plot_clusters_by_superpop, plot_coords, plot_coords_by_pop, make_animation, write_f1_scores_to_csv
 from utils.distrib_config import define_distribution_strategy
 import utils.visualization
@@ -490,13 +491,12 @@ class WeightKeeper:
 
 class ProjectedOutput:
 	"""Keeps track of projection results and related data for one saved epoch"""
+	# TODO: move this to data_handler_distrib module
 
 	def __init__(self, n_latent_dim_, n_markers_, n_total_samples_,
-	                   results_dir, epoch_, n_workers,
-	                   store=None):
+	                   n_workers, store=None):
 		# TODO: make this multi-worker
-		self.outdir = os.path.join(results_dir, f"projected_{epoch_}")
-		os.makedirs(self.outdir, exist_ok=True)
+		# TODO: might scrap store completely
 
 		self.n_dim = n_latent_dim_
 		self.n_markers = n_markers_
@@ -511,6 +511,7 @@ class ProjectedOutput:
 		self.orig_mask    = np.empty((0, self.n_markers))
 
 		self.metrics = dict()
+		self.not_implemented_warning_given = False
 
 
 	def _do_we_store_all_outputs(self, encoded, decoded, targets, mask, k=0.3):
@@ -593,34 +594,28 @@ class ProjectedOutput:
 			self.orig_mask = orig_mask_upd
 
 
-	def evaluate(self):
-		"""Get metrics for currently stored projection results"""
-		metrics_upd = EvalProjected(self.decoded, self.targets, self.orig_mask)
-		if len(self.metrics) == 0:
-			self.metrics = metrics_upd
-			return
-		for m in self.metrics:
-			try:
-				self.metrics[m] += metrics_upd[m]
-			except KeyError:
-				continue
+	def get_pred_and_true(self, loss_class, norm_mode):
+		if (  loss_class in ("CategoricalCrossentropy", "KLDivergence")
+		   and norm_mode == "genotypewise01"):
+			genotypes_pred = tf.argmax(alfreqvector(self.decoded), axis=-1)
+			genotypes_pred = tf.cast(genotypes_pred, tf.float16) * 0.5
+			genotypes_true = tf.cast(self.targets, tf.float16)
+			genotypes_mask = tf.cast(self.orig_mask, tf.bool)
+		else:
+			genotypes_pred = np.array([])
+			genotypes_true = np.array([])
+			genotypes_mask = np.array([])
+			if not self.not_implemented_warning_given:
+				print("Genotype prediction not implemented for " +
+				     f"loss {loss_class} and normalization {norm_mode}.")
+				self.not_implemented_warning_given = True
+		return genotypes_pred, genotypes_true, genotypes_mask
 
-	def combine_metrics(self):
-		"""Convert per-batch metrics into final ones"""
-		return
 
 	def write(self):
 		# write to files. per-worker!
 		# maybe combine files in the end, if many workers
 		return
-
-
-
-def EvalProjected(decoded, targets, orig_mask):
-	"""Get metrics for projection results"""
-	orig_mask = tf.cast(orig_mask, tf.bool)
-	metrics = dict()
-	return metrics
 
 
 
@@ -1266,6 +1261,7 @@ if __name__ == "__main__":
 	
 			outfilename = os.path.join(train_directory, "losses_from_train_t.csv")
 			# TODO: this is not "per epoch" anymore
+			# TODO: write these in column format, please!
 			steps_t_combined, losses_t_combined = write_metric_per_epoch_to_csv(outfilename, losses_t_per_step, all_steps)
 			fig, ax = plt.subplots()
 			plt.plot(steps_t_combined, losses_t_combined, label="train", c="orange")
@@ -1327,7 +1323,8 @@ if __name__ == "__main__":
 		           "normalization_options": norm_opts,
 		           "sparsifies"           : [0.0],
 		           "pref_chunk_size"      : None, # auto
-		           "shuffle_dataset"      : False}
+		           "shuffle_dataset"      : False,
+		           "_debug"               : False}
 		dg = DataGenerator(**dg_args)
 		n_markers = copy.deepcopy(dg.n_markers)
 		n_unique_samples = copy.deepcopy(dg.n_total_samples)
@@ -1336,13 +1333,17 @@ if __name__ == "__main__":
 		dds_proj = strat.distribute_datasets_from_function(
 		                    lambda x: dg.create_dataset_from_pq(x, split="all"))
 
+		metric_gc = GenotypeConcordance()
+		# Don't know how to handle a distribured metric.
+		# But I can calc it in a non-distributed manner anyway.
+		# So it should be outside strat scope.
+
 		# TODO: we don't need strat scope in this section,
 		#       we terminated all non-chief workers already...
 		#       also global batch size is too much
 		# TODO: actually we do need the strat.
 		#       so we can properly finalize the dataset.
 		#       AND for mutli-GPU cases actually.
-		genotype_concordance_metric = GenotypeConcordance() # TODO: put it in scope???
 		with strat.scope():
 			autoencoder = Autoencoder(model_architecture, n_markers,
 			                          noise_std, regularizer)
@@ -1387,12 +1388,10 @@ if __name__ == "__main__":
 
 			projected_data = ProjectedOutput(n_latent_dim, n_markers,
 			                                 n_unique_samples,
-			                                 results_directory, epoch,
 			                                 num_workers, store=False)
 
 			loss_value_per_batch = []
-			genotype_conc_per_batch = []
-			#genotype_concordance_metric.reset_states()
+			metric_gc.reset_states()
 			batch_count_proj = 0
 
 			for batch_input, batch_target,\
@@ -1407,21 +1406,24 @@ if __name__ == "__main__":
 				projected_data.update(batch_indpop, encoded_batch,
 				                      decoded_batch, batch_target,
 				                      batch_orig_mask)
-				if not projected_data.store:
-					projected_data.evaluate()
+
+				genos_pred, genos_true, genos_mask = \
+				   projected_data.get_pred_and_true(train_opts["loss"]["class"],
+				                                    data_opts["norm_mode"])
+
+				metric_gc.update_state(genos_true, genos_pred, genos_mask)
 
 				batch_count_proj += 1
 				if (max_batches_train is not None
 				  and batch_count_proj > max_batches_train):
 					break
 
-			if not projected_data.store:
-				projected_data.combine_metrics()
-			else:
-				projected_data.evaluate()
-
 			loss_value = np.average(loss_value_per_batch)
 			losses_train.append(loss_value)
+
+			gc_this_epoch = metric_gc.result()
+			genotype_concs_train.append(gc_this_epoch)
+			chief_print(f"Genotype concordance: {gc_this_epoch}")
 
 			if epoch == epochs[0]:
 				#assert len(projected_data.ind_pop_list) == dg.n_total_samples, \
@@ -1436,50 +1438,6 @@ if __name__ == "__main__":
 
 				write_h5(encoded_data_file, "ind_pop_list_train",
 				         np.array(projected_data.ind_pop_list, dtype='S'))
-
-
-			######## GC CALC
-
-			if False:
-				genotype_concordance_metric.reset_states()
-	
-				orig_mask_train = tf.cast(projected_data.orig_mask, tf.bool)
-				# TODO: maybe copy train_opts to project_opts in this mode or something. just for clarity.
-				if train_opts["loss"]["class"] == "MeanSquaredError" and (data_opts["norm_mode"] == "smartPCAstyle" or data_opts["norm_mode"] == "standard"):
-					try:
-						scaler = dg.scaler
-					except:
-						chief_print("Could not calculate predicted genotypes and genotype concordance. No scaler available in data handler.")
-						genotypes_output = np.array([])
-						true_genotypes = np.array([])
-	
-					genotypes_output = to_genotypes_invscale_round(projected_data.decoded, scaler_vals = scaler)
-					true_genotypes = to_genotypes_invscale_round(projected_data.targets, scaler_vals = scaler)
-					genotype_concordance_metric.update_state(y_pred = genotypes_output[orig_mask_train],
-					                                         y_true = true_genotypes[orig_mask_train])
-	
-	
-				elif train_opts["loss"]["class"] == "BinaryCrossentropy" and data_opts["norm_mode"] == "genotypewise01":
-					genotypes_output = to_genotypes_sigmoid_round(projected_data.decoded)
-					true_genotypes = projected_data.targets
-					genotype_concordance_metric.update_state(y_pred = genotypes_output[orig_mask_train],
-					                                         y_true = true_genotypes[orig_mask_train])
-	
-				elif train_opts["loss"]["class"] in ["CategoricalCrossentropy", "KLDivergence"] and data_opts["norm_mode"] == "genotypewise01":
-					genotypes_output = tf.cast(tf.argmax(alfreqvector(projected_data.decoded), axis = -1), tf.float16) * 0.5
-					true_genotypes = projected_data.targets
-					genotype_concordance_metric.update_state(y_pred = genotypes_output[orig_mask_train],
-					                                         y_true = true_genotypes[orig_mask_train])
-	
-				else:
-					chief_print("Could not calculate predicted genotypes and genotype concordance. Not implemented for loss {0} and normalization {1}.".format(train_opts["loss"]["class"], data_opts["norm_mode"]))
-					genotypes_output = np.array([])
-					true_genotypes = np.array([])
-	
-				genotype_concordance_value = genotype_concordance_metric.result()
-				genotype_concs_train.append(genotype_concordance_value)
-
-			######## END GC CALC
 
 
 			if superpopulations_file:
@@ -1520,7 +1478,7 @@ if __name__ == "__main__":
 			write_h5(encoded_data_file, f"{epoch}_encoded_train", projected_data.encoded)
 
 		######## TRUE GENOS
-		if False:
+		if False: # TODO
 			try:
 				plot_genotype_hist(np.array(genotypes_output),
 				                   os.path.join(results_directory,
@@ -1551,24 +1509,27 @@ if __name__ == "__main__":
 
 		######## GC OUT
 		if False:
+			# TODO: baseline concordance (given that true genos don't fit into RAM)
+			#       (for genotypewise01, just count the values manually)
 			try:
 				baseline_genotype_concordance = get_baseline_gc(true_genotypes)
 			except:
 				baseline_genotype_concordance = None
+		baseline_genotype_concordance = None
 
-			outfilename = os.path.join(results_directory, "genotype_concordances.csv")
-			epochs_combined, genotype_concs_combined = write_metric_per_epoch_to_csv(outfilename, genotype_concs_train, epochs)
-	
-			plt.plot(epochs_combined, genotype_concs_combined, label="train", c="orange")
-			if baseline_genotype_concordance:
-				plt.plot([epochs_combined[0], epochs_combined[-1]], [baseline_genotype_concordance, baseline_genotype_concordance], label="baseline", c="black")
-	
-			plt.xlabel("Epoch")
-			plt.ylabel("Genotype concordance")
-	
-			plt.savefig(os.path.join(results_directory, "genotype_concordances.pdf"))
-	
-			plt.close()
+		outfilename = os.path.join(results_directory, "genotype_concordances.csv")
+		epochs_combined, genotype_concs_combined = write_metric_per_epoch_to_csv(outfilename, genotype_concs_train, epochs)
+
+		plt.plot(epochs_combined, genotype_concs_combined, label="train", c="orange")
+		if baseline_genotype_concordance:
+			plt.plot([epochs_combined[0], epochs_combined[-1]], [baseline_genotype_concordance, baseline_genotype_concordance], label="baseline", c="black")
+
+		plt.xlabel("Epoch")
+		plt.ylabel("Genotype concordance")
+
+		plt.savefig(os.path.join(results_directory, "genotype_concordances.pdf"))
+
+		plt.close()
 		######## END GC OUT
 
 	if arguments['animate']:

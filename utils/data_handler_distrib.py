@@ -486,3 +486,34 @@ def auto_chunk_size(width, dtype, k=0.1):
 	bytes_per_val = np.dtype(dtype).itemsize
 	chunksize = floor(max_ram / (bytes_per_val * width))
 	return chunksize
+
+
+class GenotypeConcordance(tf.keras.metrics.Metric):
+	'''
+	Genotype concordance metric.
+
+	Assumes genotypes_true and genotypes_pred are scaled the same way.
+
+	'''
+	def __init__(self, name="genotype_concordance", **kwargs):
+		super(GenotypeConcordance, self).__init__(name=name, **kwargs)
+		self.accruary_metric = tf.keras.metrics.Accuracy()
+		# This metric can be properly updated batch-by-batch
+
+	def update_state(self, genotypes_true, genotypes_pred, mask, **kwargs):
+		try:
+			mask = tf.cast(mask, tf.bool)
+			genotypes_true = genotypes_true[mask]
+			genotypes_pred = genotypes_pred[mask]
+		except:
+			pass
+		_ = self.accruary_metric.update_state(y_true = genotypes_true,
+		                                      y_pred = genotypes_pred,
+		                                      **kwargs)
+
+	def result(self):
+		return self.accruary_metric.result()
+
+	def reset_states(self):
+		# The state of the metric will be reset at the start of each epoch.
+		self.accruary_metric.reset_states()
