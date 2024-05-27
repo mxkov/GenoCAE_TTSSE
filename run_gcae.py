@@ -886,23 +886,28 @@ if __name__ == "__main__":
 		           "normalization_options": norm_opts,
 		           "sparsifies"           : sparsifies,
 		           "pref_chunk_size"      : None, # auto
-		           "shuffle_dataset"      : True}
+		           "shuffle_dataset"      : True,
+		           "_debug"               : False}
 		dg = DataGenerator(**dg_args)
 		n_markers = copy.deepcopy(dg.n_markers)
 
-		# dds stands for tfd.DistributedDataset
-		dds_train = strat.distribute_datasets_from_function(
-		                  lambda x: dg.create_dataset_from_pq(x, split="train"))
-		if validation_split > 0.0: # TODO: mb another condition
-			dds_valid = strat.distribute_datasets_from_function(
-			              lambda x: dg.create_dataset_from_pq(x, split="valid"))
-		# TODO: right now, valid set is defined in this method.
-		#       if it gets moved to init or outer scope, we can call these later,
-		#       after setting up lr schedule and such.
-		chief_print(f"Data chunk size: {dg.pref_chunk_size}")
-
 		n_unique_train_samples = copy.deepcopy(dg.n_train_samples)
 		n_valid_samples = copy.deepcopy(dg.n_valid_samples)
+
+		def distribute_datasets(verbose=False):
+			# dds stands for tfd.DistributedDataset
+			dds_t = strat.distribute_datasets_from_function(
+			              lambda x: dg.create_dataset_from_pq(x, split="train"))
+			if n_valid_samples > 0:
+				dds_v = strat.distribute_datasets_from_function(
+				          lambda x: dg.create_dataset_from_pq(x, split="valid"))
+			else:
+				dds_v = None
+			if verbose:
+				chief_print(f"Data chunk size: {dg.pref_chunk_size}")
+			return dds_t, dds_v
+
+		dds_train, dds_valid = distribute_datasets(verbose=True)
 
 		# TODO: i don't understand what this commented block is for,
 		#       will prob remove or reimplement later
@@ -936,8 +941,9 @@ if __name__ == "__main__":
 		#step_counter = resume_from * n_train_batches
 		#step_counter = resume_from * 930  # valid every 10k
 		step_counter = resume_from * 1665  # valid every 100k
-		step_counter = resume_from * 2990  # full epoch with global batch size 160
+		step_counter = resume_from * 3000  # full epoch with global batch size 160
 		# ^ crutch for until the incomplete batches are fixed
+		# TODO: has to be a more reliable way to get this. e.g., read the old loss logs.
 		if "lr_scheme" in train_opts.keys():
 			schedule_module = getattr(eval(train_opts["lr_scheme"]["module"]), train_opts["lr_scheme"]["class"])
 			schedule_args = train_opts["lr_scheme"]["args"]
@@ -1153,6 +1159,8 @@ if __name__ == "__main__":
 			batch_count_train = 0
 
 			chief_print("\nEpoch: {}/{}...".format(effective_epoch, epochs+resume_from))
+
+			#dds_train, dds_valid = distribute_datasets(verbose=True)
 
 			for batch_input, batch_target, batch_orig_mask, _, _ in dds_train:
 				step_counter += 1

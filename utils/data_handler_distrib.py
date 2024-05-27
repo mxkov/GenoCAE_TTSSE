@@ -370,6 +370,8 @@ class DataGenerator:
 					last_batch_in_chunk = True
 
 				batches_read += 1
+				if batch_genos.shape[0] != gen_batch_size:
+					continue
 				total_batch_count += 1
 				total_sample_count += batch_genos.shape[0]
 
