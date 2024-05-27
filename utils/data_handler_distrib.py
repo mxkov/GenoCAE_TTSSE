@@ -9,6 +9,7 @@ import pyarrow.parquet as pq
 import re
 import scipy
 import tensorflow as tf
+from tensorflow.python.distribute.values import PerReplica
 from datetime import datetime
 
 # TODO: backwards compatibility with PLINK / EIGENSTRAT
@@ -517,3 +518,151 @@ class GenotypeConcordance(tf.keras.metrics.Metric):
 	def reset_states(self):
 		# The state of the metric will be reset at the start of each epoch.
 		self.accruary_metric.reset_states()
+
+
+def alfreqvector(y_pred):
+	'''
+	Get a probability distribution over genotypes from y_pred.
+	Assumes y_pred is raw model output, one scalar value per genotype.
+
+	Scales this to (0,1) and interprets this as a allele frequency, uses formula
+	for Hardy-Weinberg equilibrium to get probabilities for genotypes [0,1,2].
+
+	:param y_pred: (n_samples x n_markers) tensor of raw network output for each sample and site
+	:return: (n_samples x n_markers x 3 tensor) of genotype probabilities for each sample and site
+	'''
+
+	if len(y_pred.shape) == 2:
+		alfreq = tf.keras.activations.sigmoid(y_pred)
+		alfreq = tf.expand_dims(alfreq, -1)
+		return tf.concat(((1-alfreq)**2, 2*alfreq*(1-alfreq), alfreq**2), axis=-1)
+	else:
+		return tf.nn.softmax(y_pred)
+
+
+class ProjectedOutput:
+	"""Keeps track of projection results and related data for one saved epoch"""
+
+	def __init__(self, n_latent_dim_, n_markers_, n_total_samples_,
+	                   n_workers, store=None):
+		# TODO: make this multi-worker
+		# TODO: might scrap store completely
+
+		self.n_dim = n_latent_dim_
+		self.n_markers = n_markers_
+		self.n_total_samples = n_total_samples_
+		self.num_workers = n_workers
+		self.store = store
+
+		self.ind_pop_list = np.empty(shape=(0,2), dtype=str)
+		self.encoded      = np.empty((0, self.n_dim))
+		self.decoded      = np.empty((0, self.n_markers))
+		self.targets      = np.empty((0, self.n_markers))
+		self.orig_mask    = np.empty((0, self.n_markers))
+
+		self.metrics = dict()
+		self.not_implemented_warning_given = False
+
+
+	def _do_we_store_all_outputs(self, encoded, decoded, targets, mask, k=0.3):
+		"""Auto-determine if all outputs can be stored in memory"""
+		if k >= 1.0 or k <= 0:
+			raise ValueError("Invalid k argument: should lie between 0 and 1")
+
+		arr_sizes_per_sample = [
+		  2*50*4,  # ind_pop_list, overestimated
+		  self.n_dim * encoded.dtype.itemsize,
+		  self.n_markers * decoded.dtype.itemsize,
+		  self.n_markers * targets.dtype.itemsize,
+		  self.n_markers * mask.dtype.itemsize
+		]
+		total_size = sum(arr_sizes_per_sample) * self.n_total_samples  # bytes
+		max_ram = k*virtual_memory().available
+		if total_size > max_ram:
+			self.store = False
+		else:
+			self.store = True
+
+
+	def _unpack_from_replicas(self, *args):
+		"""Combine projected data from all devices on this worker"""
+		# TODO: standalone function instead of class method?
+		# TODO: check out strat.experimental_local_results() instead lmao.
+		#       or maybe strat.gather().
+		# https://www.tensorflow.org/api_docs/python/tf/types/experimental/distributed/PerReplica
+		all_items = list(args)
+
+		pr_checks = [type(item)==PerReplica for item in all_items]
+		one_replica   = not any(pr_checks)
+		many_replicas = all(pr_checks)
+		assert one_replica or many_replicas
+
+		if one_replica:
+			all_items = [np.array(item) for item in all_items]
+			return (*all_items,)
+
+		# list of PerReplica`s -> list of tuples:
+		all_items = [item.values for item in all_items]
+
+		replica_counts = [len(item) for item in all_items]
+		assert all([c==replica_counts[0] for c in replica_counts[1:]])
+		num_replicas = replica_counts[0]
+
+		# list of tuples -> list of numpy.ndarray`s:
+		all_items = [np.concatenate([np.array(a) for a in item], axis=0)
+		             for item in all_items]
+
+		return (*all_items,)
+
+
+	def update(self, ind_pop_upd, encoded_upd, decoded_upd,
+	                 targets_upd, orig_mask_upd):
+		"""Add new portion of projection results"""
+		ind_pop_upd, encoded_upd, decoded_upd, \
+		    targets_upd, orig_mask_upd = self._unpack_from_replicas(
+		    ind_pop_upd, encoded_upd, decoded_upd, targets_upd, orig_mask_upd)
+
+		decoded_upd = decoded_upd[:,0:self.n_markers]
+		targets_upd = targets_upd[:,0:self.n_markers]
+
+		if self.store is None:
+			self._do_we_store_all_outputs(encoded_upd, decoded_upd,
+			                              targets_upd, orig_mask_upd)
+
+		self.ind_pop_list = np.concatenate((self.ind_pop_list,
+		                                    ind_pop_upd), axis=0)
+		self.encoded = np.concatenate((self.encoded, encoded_upd), axis=0)
+
+		if self.store:
+			self.decoded   = np.concatenate((self.decoded, decoded_upd), axis=0)
+			self.targets   = np.concatenate((self.targets, targets_upd), axis=0)
+			self.orig_mask = np.concatenate((self.orig_mask, orig_mask_upd),
+			                                axis=0)
+		else:
+			self.decoded   = decoded_upd
+			self.targets   = targets_upd
+			self.orig_mask = orig_mask_upd
+
+
+	def get_pred_and_true(self, loss_class, norm_mode):
+		if (  loss_class in ("CategoricalCrossentropy", "KLDivergence")
+		   and norm_mode == "genotypewise01"):
+			genotypes_pred = tf.argmax(alfreqvector(self.decoded), axis=-1)
+			genotypes_pred = tf.cast(genotypes_pred, tf.float16) * 0.5
+			genotypes_true = tf.cast(self.targets, tf.float16)
+			genotypes_mask = tf.cast(self.orig_mask, tf.bool)
+		else:
+			genotypes_pred = np.array([])
+			genotypes_true = np.array([])
+			genotypes_mask = np.array([])
+			if not self.not_implemented_warning_given:
+				print("Genotype prediction not implemented for " +
+				     f"loss {loss_class} and normalization {norm_mode}.")
+				self.not_implemented_warning_given = True
+		return genotypes_pred, genotypes_true, genotypes_mask
+
+
+	def write(self):
+		# write to files. per-worker!
+		# maybe combine files in the end, if many workers
+		return

@@ -42,7 +42,11 @@ import tensorflow.distribute.experimental as tfde
 from tensorflow.keras import Model, layers
 from tensorflow.python.distribute.values import PerReplica
 from datetime import datetime
-from utils.data_handler_distrib import DataGenerator, GenotypeConcordance
+from utils.data_handler_distrib import (
+	DataGenerator, GenotypeConcordance,
+	ProjectedOutput,
+	alfreqvector
+)
 # TODO: look into reimplementing all these below as well:
 from utils.data_handler import get_saved_epochs, get_projected_epochs, write_h5, read_h5, get_coords_by_pop, convex_hull_error, f1_score_kNN, plot_genotype_hist, to_genotypes_sigmoid_round, to_genotypes_invscale_round, get_pops_with_k, get_ind_pop_list_from_map, get_baseline_gc, write_metric_per_epoch_to_csv
 from utils.visualization import plot_coords_by_superpop, plot_clusters_by_superpop, plot_coords, plot_coords_by_pop, make_animation, write_f1_scores_to_csv
@@ -70,15 +74,6 @@ def _isChief():
 		return os.environ["isChief"] == "1"
 	return True
 
-def chief_print1(msg):
-	if "isChief" in os.environ:
-		if os.environ["isChief"] == "1":
-			print(msg)
-	else:
-		print(msg)
-chief_print = print
-
-
 
 GCAE_DIR = Path(__file__).resolve().parent
 class Autoencoder(Model):
@@ -101,7 +96,7 @@ class Autoencoder(Model):
 		self.residuals = dict()
 		self.marker_spec_var = False
 
-		chief_print("\n______________________________ Building model ______________________________")
+		print("\n______________________________ Building model ______________________________")
 		# variable that keeps track of the size of layers in encoder, to be used when constructing decoder.
 		ns=[]
 		ns.append(n_markers)
@@ -119,7 +114,7 @@ class Autoencoder(Model):
 			activation = None
 
 		self.all_layers.append(first_layer)
-		chief_print("Adding layer: " + str(layer_module.__name__) + ": " + str(layer_args))
+		print("Adding layer: " + str(layer_module.__name__) + ": " + str(layer_args))
 
 		if first_layer_def["class"] == "conv1d" and "strides" in layer_args.keys() and layer_args["strides"] > 1:
 			ns.append(int(first_layer.shape[1]))
@@ -140,7 +135,7 @@ class Autoencoder(Model):
 			if layer_def["class"] == "Conv1D" and "strides" in layer_def.keys() and layer_def["strides"] > 1:
 				raise NotImplementedError
 
-			chief_print("Adding layer: " + str(layer_module.__name__) + ": " + str(layer_args))
+			print("Adding layer: " + str(layer_module.__name__) + ": " + str(layer_args))
 
 			if "name" in layer_args and (layer_args["name"] == "i_msvar" or layer_args["name"] == "nms"):
 				self.marker_spec_var = True
@@ -165,7 +160,7 @@ class Autoencoder(Model):
 			self.ms_variable = tf.Variable(random_uniform(shape = (1, n_markers), dtype=tf.float32), name="marker_spec_var")
 			self.nms_variable = tf.Variable(random_uniform(shape = (1, n_markers), dtype=tf.float32), name="nmarker_spec_var")
 		else:
-			chief_print("No marker specific variable.")
+			print("No marker specific variable.")
 
 
 	def call(self, input_data, is_training = True, verbose = False):
@@ -191,14 +186,14 @@ class Autoencoder(Model):
 			input_data = concatted_input
 
 		if verbose:
-			chief_print("inputs shape " + str(input_data.shape))
+			print("inputs shape " + str(input_data.shape))
 
 		first_layer = self.all_layers[0]
 		counter = 1
 
 		if verbose:
-			chief_print("layer {0}".format(counter))
-			chief_print("--- type: {0}".format(type(first_layer)))
+			print("layer {0}".format(counter))
+			print("--- type: {0}".format(type(first_layer)))
 
 		x = first_layer(inputs=input_data)
 
@@ -207,7 +202,7 @@ class Autoencoder(Model):
 			if not out == None:
 				x = out
 		if verbose:
-			chief_print("--- shape: {0}".format(x.shape))
+			print("--- shape: {0}".format(x.shape))
 
 		# indicator if were doing genetic clustering (ADMIXTURE-style) or not
 		have_encoded_raw = False
@@ -225,7 +220,7 @@ class Autoencoder(Model):
 			counter += 1
 
 			if verbose:
-				chief_print("layer {0}: {1} ({2}) ".format(counter, layer_name, type(layer_def)))
+				print("layer {0}: {1} ({2}) ".format(counter, layer_name, type(layer_def)))
 
 			if layer_name == "dropout":
 				x = layer_def(x, training = is_training)
@@ -259,7 +254,7 @@ class Autoencoder(Model):
 				x = self.injectms(verbose, x, layer_name, nms_tiled, self.nms_variable)
 
 			if verbose:
-				chief_print("--- shape: {0}".format(x.shape))
+				print("--- shape: {0}".format(x.shape))
 
 		if self.regularizer and encoded_data is not None:
 			reg_module = eval(self.regularizer["module"])
@@ -281,12 +276,12 @@ class Autoencoder(Model):
 		res_number = suffix[0:-1]
 		if suffix.endswith("a"):
 			if verbose:
-				chief_print("encoder-to-decoder residual: saving residual {}".format(res_number))
+				print("encoder-to-decoder residual: saving residual {}".format(res_number))
 			self.residuals[res_number] = input
 			return None
 		if suffix.endswith("b"):
 			if verbose:
-				chief_print("encoder-to-decoder residual: adding residual {}".format(res_number))
+				print("encoder-to-decoder residual: adding residual {}".format(res_number))
 			residual_tensor = self.residuals[res_number]
 			res_length = residual_tensor.shape[1]
 			if len(residual_tensor.shape) == 3:
@@ -298,7 +293,7 @@ class Autoencoder(Model):
 
 	def injectms(self, verbose, x, layer_name, ms_tiled, ms_variable):
 		if verbose:
-			chief_print("----- injecting marker-specific variable")
+			print("----- injecting marker-specific variable")
 
 		# if we need to reshape ms_variable before concatting it
 		if not self.n_markers == x.shape[1]:
@@ -315,14 +310,14 @@ class Autoencoder(Model):
 
 		if "_sg" in layer_name:
 			if verbose:
-				chief_print("----- stopping gradient for marker-specific variable")
+				print("----- stopping gradient for marker-specific variable")
 			ms_tiled = tf.stop_gradient(ms_tiled)
 
 
 		if verbose:
-			chief_print("ms var {}".format(ms_variable.shape))
-			chief_print("ms tiled {}".format(ms_tiled.shape))
-			chief_print("concatting: {0} {1}".format(x.shape, ms_tiled.shape))
+			print("ms var {}".format(ms_variable.shape))
+			print("ms tiled {}".format(ms_tiled.shape))
+			print("concatting: {0} {1}".format(x.shape, ms_tiled.shape))
 
 		x = tf.concat([x, ms_tiled], 2)
 
@@ -419,25 +414,6 @@ def get_batches(n_samples, batch_size):
 
 	return n_batches, n_samples_last_batch
 
-def alfreqvector(y_pred):
-	'''
-	Get a probability distribution over genotypes from y_pred.
-	Assumes y_pred is raw model output, one scalar value per genotype.
-
-	Scales this to (0,1) and interprets this as a allele frequency, uses formula
-	for Hardy-Weinberg equilibrium to get probabilities for genotypes [0,1,2].
-
-	:param y_pred: (n_samples x n_markers) tensor of raw network output for each sample and site
-	:return: (n_samples x n_markers x 3 tensor) of genotype probabilities for each sample and site
-	'''
-
-	if len(y_pred.shape) == 2:
-		alfreq = tf.keras.activations.sigmoid(y_pred)
-		alfreq = tf.expand_dims(alfreq, -1)
-		return tf.concat(((1-alfreq) ** 2, 2 * alfreq * (1 - alfreq), alfreq ** 2), axis=-1)
-	else:
-		return tf.nn.softmax(y_pred)
-
 
 class WeightKeeper:
 	# "Apparently, in order to save the model, the save_model call needs to be made on all processes,
@@ -480,7 +456,7 @@ class WeightKeeper:
 		startTime = datetime.now()
 		model.save_weights(weights_file_prefix, save_format ="tf")
 		save_time = (datetime.now() - startTime).total_seconds()
-		chief_print(f"-------- Saving weights: {weights_file_prefix} "+
+		print(f"-------- Saving weights: {weights_file_prefix} "+
 		            f"time: {save_time}")
 
 	def cleanup(self):
@@ -489,145 +465,16 @@ class WeightKeeper:
 			shutil.rmtree(self.weights_dir)
 
 
-class ProjectedOutput:
-	"""Keeps track of projection results and related data for one saved epoch"""
-	# TODO: move this to data_handler_distrib module
-
-	def __init__(self, n_latent_dim_, n_markers_, n_total_samples_,
-	                   n_workers, store=None):
-		# TODO: make this multi-worker
-		# TODO: might scrap store completely
-
-		self.n_dim = n_latent_dim_
-		self.n_markers = n_markers_
-		self.n_total_samples = n_total_samples_
-		self.num_workers = n_workers
-		self.store = store
-
-		self.ind_pop_list = np.empty(shape=(0,2), dtype=str)
-		self.encoded      = np.empty((0, self.n_dim))
-		self.decoded      = np.empty((0, self.n_markers))
-		self.targets      = np.empty((0, self.n_markers))
-		self.orig_mask    = np.empty((0, self.n_markers))
-
-		self.metrics = dict()
-		self.not_implemented_warning_given = False
-
-
-	def _do_we_store_all_outputs(self, encoded, decoded, targets, mask, k=0.3):
-		"""Auto-determine if all outputs can be stored in memory"""
-		if k >= 1.0 or k <= 0:
-			raise ValueError("Invalid k argument: should lie between 0 and 1")
-
-		arr_sizes_per_sample = [
-		  2*50*4,  # ind_pop_list, overestimated
-		  self.n_dim * encoded.dtype.itemsize,
-		  self.n_markers * decoded.dtype.itemsize,
-		  self.n_markers * targets.dtype.itemsize,
-		  self.n_markers * mask.dtype.itemsize
-		]
-		total_size = sum(arr_sizes_per_sample) * self.n_total_samples  # bytes
-		max_ram = k*virtual_memory().available
-		if total_size > max_ram:
-			self.store = False
-		else:
-			self.store = True
-
-
-	def _unpack_from_replicas(self, *args):
-		"""Combine projected data from all devices on this worker"""
-		# TODO: standalone function instead of class method?
-		# TODO: check out strat.experimental_local_results() instead lmao.
-		#       or maybe strat.gather().
-		# https://www.tensorflow.org/api_docs/python/tf/types/experimental/distributed/PerReplica
-		all_items = list(args)
-
-		pr_checks = [type(item)==PerReplica for item in all_items]
-		one_replica   = not any(pr_checks)
-		many_replicas = all(pr_checks)
-		assert one_replica or many_replicas
-
-		if one_replica:
-			all_items = [np.array(item) for item in all_items]
-			return (*all_items,)
-
-		# list of PerReplica`s -> list of tuples:
-		all_items = [item.values for item in all_items]
-
-		replica_counts = [len(item) for item in all_items]
-		assert all([c==replica_counts[0] for c in replica_counts[1:]])
-		num_replicas = replica_counts[0]
-
-		# list of tuples -> list of numpy.ndarray`s:
-		all_items = [np.concatenate([np.array(a) for a in item], axis=0)
-		             for item in all_items]
-
-		return (*all_items,)
-
-
-	def update(self, ind_pop_upd, encoded_upd, decoded_upd,
-	                 targets_upd, orig_mask_upd):
-		"""Add new portion of projection results"""
-		ind_pop_upd, encoded_upd, decoded_upd, \
-		    targets_upd, orig_mask_upd = self._unpack_from_replicas(
-		    ind_pop_upd, encoded_upd, decoded_upd, targets_upd, orig_mask_upd)
-
-		decoded_upd = decoded_upd[:,0:self.n_markers]
-		targets_upd = targets_upd[:,0:self.n_markers]
-
-		if self.store is None:
-			self._do_we_store_all_outputs(encoded_upd, decoded_upd,
-			                              targets_upd, orig_mask_upd)
-
-		self.ind_pop_list = np.concatenate((self.ind_pop_list,
-		                                    ind_pop_upd), axis=0)
-		self.encoded = np.concatenate((self.encoded, encoded_upd), axis=0)
-
-		if self.store:
-			self.decoded   = np.concatenate((self.decoded, decoded_upd), axis=0)
-			self.targets   = np.concatenate((self.targets, targets_upd), axis=0)
-			self.orig_mask = np.concatenate((self.orig_mask, orig_mask_upd),
-			                                axis=0)
-		else:
-			self.decoded   = decoded_upd
-			self.targets   = targets_upd
-			self.orig_mask = orig_mask_upd
-
-
-	def get_pred_and_true(self, loss_class, norm_mode):
-		if (  loss_class in ("CategoricalCrossentropy", "KLDivergence")
-		   and norm_mode == "genotypewise01"):
-			genotypes_pred = tf.argmax(alfreqvector(self.decoded), axis=-1)
-			genotypes_pred = tf.cast(genotypes_pred, tf.float16) * 0.5
-			genotypes_true = tf.cast(self.targets, tf.float16)
-			genotypes_mask = tf.cast(self.orig_mask, tf.bool)
-		else:
-			genotypes_pred = np.array([])
-			genotypes_true = np.array([])
-			genotypes_mask = np.array([])
-			if not self.not_implemented_warning_given:
-				print("Genotype prediction not implemented for " +
-				     f"loss {loss_class} and normalization {norm_mode}.")
-				self.not_implemented_warning_given = True
-		return genotypes_pred, genotypes_true, genotypes_mask
-
-
-	def write(self):
-		# write to files. per-worker!
-		# maybe combine files in the end, if many workers
-		return
-
-
 
 if __name__ == "__main__":
-	chief_print(f"\n{datetime.now().time()}\n")
-	chief_print("tensorflow version {0}".format(tf.__version__))
+	print(f"\n{datetime.now().time()}\n")
+	print("tensorflow version {0}".format(tf.__version__))
 	tf.keras.backend.set_floatx('float32')
 
 	try:
 		arguments = docopt(__doc__, version='GenoCAE 1.1.0')
 	except DocoptExit:
-		chief_print("Invalid command. Run 'python run_gcae.py --help' for more information.")
+		print("Invalid command. Run 'python run_gcae.py --help' for more information.")
 		exit(1)
 
 	for k in list(arguments.keys()):
@@ -645,8 +492,8 @@ if __name__ == "__main__":
 		sys.exit(0)
 
 	num_devices = strat.num_replicas_in_sync
-	chief_print("Number of workers: {}".format(num_workers))
-	chief_print('Number of devices: {}'.format(num_devices))
+	print("Number of workers: {}".format(num_workers))
+	print('Number of devices: {}'.format(num_devices))
 
 
 	if arguments["trainedmodeldir"]:
@@ -701,16 +548,16 @@ if __name__ == "__main__":
 		if "encoding_raw" in layer_def.keys():
 			doing_clustering = True
 
-	chief_print("\n______________________________ arguments ______________________________")
+	print("\n______________________________ arguments ______________________________")
 	for k in arguments.keys():
-		chief_print(k + " : " + str(arguments[k]))
-	chief_print("\n______________________________ data opts ______________________________")
+		print(k + " : " + str(arguments[k]))
+	print("\n______________________________ data opts ______________________________")
 	for k in data_opts.keys():
-		chief_print(k + " : " + str(data_opts[k]))
-	chief_print("\n______________________________ train opts ______________________________")
+		print(k + " : " + str(data_opts[k]))
+	print("\n______________________________ train opts ______________________________")
 	for k in train_opts:
-		chief_print(k + " : " + str(train_opts[k]))
-	chief_print("______________________________")
+		print(k + " : " + str(train_opts[k]))
+	print("______________________________")
 
 
 	batch_size = train_opts["batch_size"]
@@ -761,9 +608,9 @@ if __name__ == "__main__":
 		fill_missing = False
 
 	if fill_missing:
-		chief_print("Imputing originally missing genotypes to most common value.")
+		print("Imputing originally missing genotypes to most common value.")
 	else:
-		chief_print("Keeping originally missing genotypes.")
+		print("Keeping originally missing genotypes.")
 		n_input_channels = 2
 
 	if not train_directory:
@@ -796,9 +643,9 @@ if __name__ == "__main__":
 		if os.path.isfile(encoded_data_file):
 			encoded_data = h5py.File(encoded_data_file, 'r')
 		else:
-			chief_print("------------------------------------------------------------------------")
-			chief_print("Error: File {0} not found.".format(encoded_data_file))
-			chief_print("------------------------------------------------------------------------")
+			print("------------------------------------------------------------------------")
+			print("Error: File {0} not found.".format(encoded_data_file))
+			print("------------------------------------------------------------------------")
 			exit(1)
 
 		epochs = get_projected_epochs(encoded_data_file)
@@ -808,23 +655,23 @@ if __name__ == "__main__":
 			if epoch in epochs:
 				epochs = [epoch]
 			else:
-				chief_print("------------------------------------------------------------------------")
-				chief_print("Error: Epoch {0} not found in {1}.".format(epoch, encoded_data_file))
-				chief_print("------------------------------------------------------------------------")
+				print("------------------------------------------------------------------------")
+				print("Error: Epoch {0} not found in {1}.".format(epoch, encoded_data_file))
+				print("------------------------------------------------------------------------")
 				exit(1)
 
 		if doing_clustering:
 			if arguments['animate']:
-				chief_print("------------------------------------------------------------------------")
-				chief_print("Error: Animate not supported for genetic clustering model.")
-				chief_print("------------------------------------------------------------------------")
+				print("------------------------------------------------------------------------")
+				print("Error: Animate not supported for genetic clustering model.")
+				print("------------------------------------------------------------------------")
 				exit(1)
 
 
 			if arguments['plot'] and not superpopulations_file:
-				chief_print("------------------------------------------------------------------------")
-				chief_print("Error: Plotting of genetic clustering results requires a superpopulations file.")
-				chief_print("------------------------------------------------------------------------")
+				print("------------------------------------------------------------------------")
+				print("Error: Plotting of genetic clustering results requires a superpopulations file.")
+				print("------------------------------------------------------------------------")
 				exit(1)
 
 	else:
@@ -899,7 +746,7 @@ if __name__ == "__main__":
 			else:
 				dds_v = None
 			if verbose:
-				chief_print(f"Data chunk size: {dg.pref_chunk_size}")
+				print(f"Data chunk size: {dg.pref_chunk_size}")
 			return dds_t, dds_v
 
 		dds_train, dds_valid = distribute_datasets(verbose=True)
@@ -954,16 +801,16 @@ if __name__ == "__main__":
 			updated_lr = lr_schedule(step_counter)
 			lr_schedule = schedule_module(updated_lr, **schedule_args)
 
-			chief_print("Using learning rate schedule {0}.{1} with {2}".format(train_opts["lr_scheme"]["module"], train_opts["lr_scheme"]["class"], schedule_args))
+			print("Using learning rate schedule {0}.{1} with {2}".format(train_opts["lr_scheme"]["module"], train_opts["lr_scheme"]["class"], schedule_args))
 		else:
 			lr_schedule = False
 
-		chief_print("\n______________________________ Data ______________________________")
-		chief_print("N unique train samples: {0}".format(n_unique_train_samples))
-		chief_print("--- training on : {0}".format(n_train_samples))
-		chief_print("N valid samples: {0}".format(n_valid_samples))
-		chief_print("N markers: {0}".format(n_markers))
-		chief_print("")
+		print("\n______________________________ Data ______________________________")
+		print("N unique train samples: {0}".format(n_unique_train_samples))
+		print("--- training on : {0}".format(n_train_samples))
+		print("N valid samples: {0}".format(n_valid_samples))
+		print("N markers: {0}".format(n_markers))
+		print("")
 
 		with strat.scope():
 			autoencoder = Autoencoder(model_architecture, n_markers,
@@ -1009,10 +856,10 @@ if __name__ == "__main__":
 			orig_mask_init = orig_mask_init.values[0]
 
 		if resume_from:
-			chief_print("\n______________________________ Resuming training from epoch {0} ______________________________".format(resume_from))
+			print("\n______________________________ Resuming training from epoch {0} ______________________________".format(resume_from))
 			weights_file_prefix = ae_weight_manager.get_full_fileprefix(
 			                                          str(resume_from))
-			chief_print(f"Reading weights from {weights_file_prefix}")
+			print(f"Reading weights from {weights_file_prefix}")
 
 			# This initializes the variables used by the optimizers,
 			# as well as any stateful metric variables
@@ -1022,11 +869,11 @@ if __name__ == "__main__":
 			with strat.scope():
 				autoencoder.load_weights(weights_file_prefix)
 
-		chief_print("\n______________________________ Train ______________________________")
+		print("\n______________________________ Train ______________________________")
 
 		# a small run-through of the model with just 2 samples for printing the dimensions of the layers (verbose=True)
-		chief_print("Model layers and dimensions:")
-		chief_print("-----------------------------")
+		print("Model layers and dimensions:")
+		print("-----------------------------")
 		with strat.scope():
 			_, _ = autoencoder(input_init[:2,:], is_training=False, verbose=True)
 
@@ -1124,7 +971,7 @@ if __name__ == "__main__":
 			#evals_since_min_valid_loss_ = eff_epoch - min_valid_loss_epoch_
 			evals_since_min_valid_loss_ = step_count - min_valid_loss_step_
 			timenow = datetime.now().time()
-			chief_print("--- Valid loss: {:.4f} ".format(valid_loss_this_eval_) +
+			print("--- Valid loss: {:.4f} ".format(valid_loss_this_eval_) +
 			           f" time: {valid_time} ({timenow})" +
 			            " min loss: {:.4f} ".format(min_valid_loss_) +
 			           f" steps since: {evals_since_min_valid_loss_}")
@@ -1140,10 +987,10 @@ if __name__ == "__main__":
 
 		######################################################
 
-		chief_print(f"\nTraining start: {datetime.now().time()}")
-		chief_print(f"Step count: {step_counter}")
-		chief_print(f"Train samples: {n_train_samples}")
-		chief_print(f"Valid samples: {n_valid_samples}")
+		print(f"\nTraining start: {datetime.now().time()}")
+		print(f"Step count: {step_counter}")
+		print(f"Train samples: {n_train_samples}")
+		print(f"Valid samples: {n_valid_samples}")
 
 		for e in range(1,epochs+1):
 			# TODO: profiler, mayhaps?
@@ -1153,7 +1000,7 @@ if __name__ == "__main__":
 			losses_t_per_batch = []
 			batch_count_train = 0
 
-			chief_print("\nEpoch: {}/{}...".format(effective_epoch, epochs+resume_from))
+			print("\nEpoch: {}/{}...".format(effective_epoch, epochs+resume_from))
 
 			#dds_train, dds_valid = distribute_datasets(verbose=True)
 
@@ -1183,7 +1030,7 @@ if __name__ == "__main__":
 					current_mean_loss = accum_loss_t / batches_since_last_loss
 					tracked_steps_t.append(step_counter)
 					tracked_losses_t.append(current_mean_loss)
-					chief_print("--- Train loss: {:.4f}".format(current_mean_loss))
+					print("--- Train loss: {:.4f}".format(current_mean_loss))
 					WriteSummaryTrain(train_batch_loss, step_counter)
 					batches_since_last_loss = 0
 					accum_loss_t = 0.0
@@ -1236,7 +1083,7 @@ if __name__ == "__main__":
 			train_times.append(train_time)
 			train_epochs.append(effective_epoch)
 
-			chief_print("--- Mean loss this epoch: {:.4f}  time: {} ({})".format(
+			print("--- Mean loss this epoch: {:.4f}  time: {} ({})".format(
 			          train_loss_this_epoch, train_time, datetime.now().time()))
 
 			# TODO: write mean losses per epoch separately
@@ -1283,7 +1130,7 @@ if __name__ == "__main__":
 			plt.savefig(os.path.join(train_directory, "losses_from_train.pdf"))
 			plt.close()
 
-		chief_print("Done training at {0}. Wrote to {1}".format(
+		print("Done training at {0}. Wrote to {1}".format(
 		            datetime.now().time(), train_directory))
 		ae_weight_manager.cleanup()
 
@@ -1311,8 +1158,8 @@ if __name__ == "__main__":
 			except:
 				continue
 
-		chief_print("Projecting epochs: {0}".format(epochs))
-		chief_print("Already projected: {0}".format(projected_epochs))
+		print("Projecting epochs: {0}".format(epochs))
+		print("Already projected: {0}".format(projected_epochs))
 
 		dg_args = {"filebase"             : data_prefix,
 		           "global_batch_size"    : global_batch_size,
@@ -1377,9 +1224,9 @@ if __name__ == "__main__":
 		edgecolors_per_epoch = []
 
 		for epoch in epochs:
-			chief_print("########################### epoch {0} ###########################".format(epoch))
+			print("########################### epoch {0} ###########################".format(epoch))
 			weights_file_prefix=ae_weight_manager.get_full_fileprefix(str(epoch))
-			chief_print(f"Reading weights from {weights_file_prefix}")
+			print(f"Reading weights from {weights_file_prefix}")
 
 			# TODO: find out if we should run 1-2 samples through optimization
 			#       in order to load the weights here.
@@ -1423,7 +1270,7 @@ if __name__ == "__main__":
 
 			gc_this_epoch = metric_gc.result()
 			genotype_concs_train.append(gc_this_epoch)
-			chief_print(f"Genotype concordance: {gc_this_epoch}")
+			print(f"Genotype concordance: {gc_this_epoch}")
 
 			if epoch == epochs[0]:
 				#assert len(projected_data.ind_pop_list) == dg.n_total_samples, \
@@ -1432,9 +1279,9 @@ if __name__ == "__main__":
 				#       f"{len(projected_data.encoded)} vs {dg.n_total_samples}"
 				# TODO: return to the asserts after fixing all issues
 				if len(projected_data.ind_pop_list) != dg.n_total_samples:
-					chief_print(f"MISMATCH in ind_pop_list: {len(projected_data.ind_pop_list)} vs {dg.n_total_samples}")
+					print(f"MISMATCH in ind_pop_list: {len(projected_data.ind_pop_list)} vs {dg.n_total_samples}")
 				if len(projected_data.encoded) != dg.n_total_samples:
-					chief_print(f"MISMATCH in encoded: {len(projected_data.encoded)} vs {dg.n_total_samples}")
+					print(f"MISMATCH in encoded: {len(projected_data.encoded)} vs {dg.n_total_samples}")
 
 				write_h5(encoded_data_file, "ind_pop_list_train",
 				         np.array(projected_data.ind_pop_list, dtype='S'))
@@ -1503,7 +1350,7 @@ if __name__ == "__main__":
 		plt.savefig(os.path.join(results_directory, "losses_from_project.pdf"))
 		plt.close()
 
-		chief_print(f"\n{datetime.now().time()}\n")
+		print(f"\n{datetime.now().time()}\n")
 
 		############################### gconc ###############################
 
@@ -1537,7 +1384,7 @@ if __name__ == "__main__":
 			print("Work has ended for this worker")
 			exit(0)
 
-		chief_print("Animating epochs {}".format(epochs))
+		print("Animating epochs {}".format(epochs))
 
 		FFMpegWriter = animation.writers['ffmpeg']
 		scatter_points_per_epoch = []
@@ -1548,7 +1395,7 @@ if __name__ == "__main__":
 		ind_pop_list_train = read_h5(encoded_data_file, "ind_pop_list_train")
 
 		for epoch in epochs:
-			chief_print("########################### epoch {0} ###########################".format(epoch))
+			print("########################### epoch {0} ###########################".format(epoch))
 
 			encoded_train = read_h5(encoded_data_file, "{0}_encoded_train".format(epoch))
 
@@ -1582,7 +1429,7 @@ if __name__ == "__main__":
 			print("Work has ended for this worker")
 			exit(0)
 
-		chief_print("Evaluating epochs {}".format(epochs))
+		print("Evaluating epochs {}".format(epochs))
 
 		# all metrics assumed to have a single value per epoch
 		if arguments['metrics']:
@@ -1605,7 +1452,7 @@ if __name__ == "__main__":
 				pass
 
 		for epoch in epochs:
-			chief_print("########################### epoch {0} ###########################".format(epoch))
+			print("########################### epoch {0} ###########################".format(epoch))
 
 			encoded_train = read_h5(encoded_data_file, "{0}_encoded_train".format(epoch))
 
@@ -1636,7 +1483,7 @@ if __name__ == "__main__":
 					else:
 						min_points_required = n_latent_dim + 2
 					hull_error = convex_hull_error(coords_by_pop, plot=False, min_points_required= min_points_required)
-					chief_print("------ hull error : {}".format(hull_error))
+					print("------ hull error : {}".format(hull_error))
 
 					metrics[m].append(hull_error)
 
@@ -1660,7 +1507,7 @@ if __name__ == "__main__":
 
 
 					f1_score_avg, f1_score_per_pop = f1_score_kNN(encoded_train, pop_list, pops_to_use, k = k)
-					chief_print("------ f1 score with {0}NN :{1}".format(k, f1_score_avg))
+					print("------ f1 score with {0}NN :{1}".format(k, f1_score_avg))
 					metrics[m].append(f1_score_avg)
 					assert len(f1_score_per_pop) == len(pops_to_use)
 					f1_scores_by_pop["avg"][this_f1_score_index] =  "{:.4f}".format(f1_score_avg)
@@ -1676,9 +1523,9 @@ if __name__ == "__main__":
 						f1_scores_by_pop[pops_to_use[p]][this_f1_score_index] =  "{:.4f}".format(f1_score_per_pop[p])
 
 				else:
-					chief_print("------------------------------------------------------------------------")
-					chief_print("Error: Metric {0} is not implemented.".format(m))
-					chief_print("------------------------------------------------------------------------")
+					print("------------------------------------------------------------------------")
+					print("Error: Metric {0} is not implemented.".format(m))
+					print("------------------------------------------------------------------------")
 
 			write_f1_scores_to_csv(results_directory, "epoch_{0}".format(epoch), superpopulations_file, f1_scores_by_pop, coords_by_pop)
 
@@ -1701,7 +1548,7 @@ if __name__ == "__main__":
 			print("Work has ended for this worker")
 			exit(0)
 
-		chief_print("Plotting epochs {}".format(epochs))
+		print("Plotting epochs {}".format(epochs))
 
 		ind_pop_list_train = read_h5(encoded_data_file, "ind_pop_list_train")
 		pop_list = []
@@ -1713,7 +1560,7 @@ if __name__ == "__main__":
 				pass
 
 		for epoch in epochs:
-			chief_print("########################### epoch {0} ###########################".format(epoch))
+			print("########################### epoch {0} ###########################".format(epoch))
 
 			encoded_train = read_h5(encoded_data_file, "{0}_encoded_train".format(epoch))
 
