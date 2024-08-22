@@ -1,0 +1,11 @@
+{
+	"datadir"         : "/mnt/ukb",
+	"data"            : "ukb22418_b0_v2",
+	"model_id"        : "M1",
+	"train_opts_id"   : "ex4",
+	"data_opts_id"    : "b_0_5",
+	"trainedmodeldir" : "ae_out_test_UKB",
+	"epochs"          : 1,
+	"loss_interval"   : 100000,
+	"save_interval"   : 1
+}
