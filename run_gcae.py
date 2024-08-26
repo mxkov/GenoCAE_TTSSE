@@ -767,8 +767,8 @@ if __name__ == "__main__":
 		# TODO: double-check if these batch sizes are consistent with dg.
 		#       maybe we can even put get_batches() in there as a method.
 		#       google, how to get number of batches in a tf.data.Dataset obj?
-		# TODO: actually, since get_batches() is only used by the scheduler,
-		#       there should be an easy way to do without.
+		# TODO: for setting up the scheduler,
+		#       there should be an easy way to do without get_batches().
 		#       for example, save batch count to wherever we're resuming from.
 		(n_train_batches,
 		 n_train_samples_last_batch) = get_batches(n_train_samples, batch_size)
@@ -1063,7 +1063,10 @@ if __name__ == "__main__":
 
 			# one more validation block
 			# (i want a callback instead :c)
-			if batches_since_last_valid > 5:
+			#
+			# this condition should provide at least 1 validation run per epoch
+			# (as long as get_batches() works)
+			if batches_since_last_valid > 0.1*n_train_batches:
 				#### validation block ####
 				valid_loss_this_eval, \
 				min_valid_loss, min_valid_loss_epoch, \
