@@ -170,9 +170,11 @@ def saved_weights_exist(result_dir, param_dict):
 	if patience is None:
 		# (if patience is not None, training could stop at any time
 		#  and we cannot predict how many of these would be saved)
-		expected_epochs.extend([get_effective_epoch(e)
-		                        for e in range(1,epochs+1)
-		                        if e%save_interval==0 and e>start_saving_from])
+		new_epochs = [get_effective_epoch(e)
+		              for e in range(1,epochs+1)
+		              if e%save_interval==0 and e>start_saving_from]
+		new_epochs = [ep for ep in new_epochs if ep not in expected_epochs]
+		expected_epochs.extend(new_epochs)
 	# +1 model state for min valid loss:
 	expect_min_valid = (epochs-start_saving_from > 0)
 	expected_epochs.sort()
