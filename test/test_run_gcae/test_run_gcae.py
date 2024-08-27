@@ -177,9 +177,9 @@ def parse_params(param_dict):
 	return param_dict
 
 
-def test_run_gcae(f_dataset, cleanup=True):
+def test_run_gcae(f_param_id_test, cleanup=True):
 	"""Run run_gcae.py in train mode, make sure it runs, check the output."""
-	params = load_params(f_dataset)
+	params = load_params(f_param_id_test)
 	if "cleanup" in params:
 		cleanup = params.pop("cleanup")
 

@@ -1,8 +1,9 @@
 import pytest
 
-@pytest.fixture
-def f_dataset(request):
+@pytest.fixture(params=["tiny_01", "tiny_02"])
+def f_param_id_test(request):
 	return request.param
 
-def pytest_generate_tests(metafunc):
-	metafunc.parametrize("f_dataset", ["tiny", "UKB"])
+@pytest.fixture(params=["tiny_01"])
+def f_param_id_benchmark(request):
+	return request.param

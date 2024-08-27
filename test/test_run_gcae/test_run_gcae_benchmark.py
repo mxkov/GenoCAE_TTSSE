@@ -12,7 +12,7 @@ from common import (
 )
 
 
-def test_run_gcae_benchmark(benchmark, f_dataset):
+def test_run_gcae_benchmark(benchmark, f_param_id_benchmark):
 	"""Benchmark run_gcae.py in train mode."""
 	def run_gcae_train_and_cleanup(**param_dict):
 		compl_proc, result_location = run_gcae_train(**param_dict)
@@ -20,5 +20,5 @@ def test_run_gcae_benchmark(benchmark, f_dataset):
 		assert success, else_msg
 		do_cleanup(result_location)
 
-	params = load_params(f_dataset)
+	params = load_params(f_param_id_benchmark)
 	_ = benchmark(run_gcae_train_and_cleanup, **params)

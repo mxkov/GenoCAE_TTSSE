@@ -1,0 +1,11 @@
+{
+	"datadir"         : "example_tiny/parquet",
+	"data"            : "HumanOrigins249_tiny",
+	"model_id"        : "M1",
+	"train_opts_id"   : "ex3",
+	"data_opts_id"    : "b_0_4",
+	"trainedmodeldir" : "ae_out_test_tiny",
+	"epochs"          : 3,
+	"save_interval"   : 4,
+	"loss_interval"   : 11
+}
