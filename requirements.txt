@@ -1,8 +1,8 @@
 docopt
 grpcio
 matplotlib
-numba
-numpy
+numba==0.58.1
+numpy==1.25.2
 pandas
 pandas-plink
 Pillow
