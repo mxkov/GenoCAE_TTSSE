@@ -243,8 +243,11 @@ class DataGenerator:
 		if len(pq_paths) % num_workers != 0:
 			raise RuntimeError(f"Can't distribute {len(pq_paths)} input files" +
 			                   f" evenly between {num_workers} workers")
+		num_files = len(pq_paths)
 
 		ds = tf.data.Dataset.from_tensor_slices(pq_paths)
+		if self.shuffle_dataset:
+			ds = ds.shuffle(num_files, reshuffle_each_iteration=True)
 		ds = ds.shard(num_workers, worker_id)
 
 		if self._debug:
