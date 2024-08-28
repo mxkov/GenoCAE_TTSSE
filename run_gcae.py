@@ -455,14 +455,23 @@ class WeightKeeper:
 		                                               chief_only=False)
 		startTime = datetime.now()
 		model.save_weights(weights_file_prefix, save_format ="tf")
+		self.remove_tmp_weights()
 		save_time = (datetime.now() - startTime).total_seconds()
 		print(f"-------- Saving weights: {weights_file_prefix} "+
-		            f"time: {save_time}")
+		      f"time: {save_time}")
+
+	def remove_tmp_weights(self):
+		if _isChief():
+			return
+		assert self.weights_dir != self.weights_dir_chief
+		for file in os.listdir(self.weights_dir):
+			os.remove(os.path.join(self.weights_dir, file))
 
 	def cleanup(self):
-		if not _isChief():
-			assert self.weights_dir != self.weights_dir_chief
-			shutil.rmtree(self.weights_dir)
+		if _isChief():
+			return
+		assert self.weights_dir != self.weights_dir_chief
+		shutil.rmtree(self.weights_dir)
 
 
 
