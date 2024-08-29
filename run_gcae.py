@@ -474,6 +474,13 @@ class WeightKeeper:
 		shutil.rmtree(self.weights_dir)
 
 
+def get_latest_step(train_dir):
+	loss_log = os.path.join(train_dir, "losses_from_train_t.csv")
+	f = open(loss_log, "r")
+	latest_step = int(float(f.readline().strip().split(",")[-1]))
+	f.close()
+	return latest_step
+
 
 if __name__ == "__main__":
 	print(f"\n{datetime.now().time()}\n")
@@ -789,12 +796,10 @@ if __name__ == "__main__":
 		save_epochs  = []
 
 		############### setup learning rate schedule ##############
-		#step_counter = resume_from * n_train_batches
-		#step_counter = resume_from * 930  # valid every 10k
-		step_counter = resume_from * 1665  # valid every 100k
-		step_counter = resume_from * 3000  # full epoch with global batch size 160
-		# ^ crutch for until the incomplete batches are fixed
-		# TODO: has to be a more reliable way to get this. e.g., read the old loss logs.
+		if resume_from:
+			step_counter = get_latest_step(train_directory)
+		else:
+			step_counter = 0
 		if "lr_scheme" in train_opts.keys():
 			schedule_module = getattr(eval(train_opts["lr_scheme"]["module"]), train_opts["lr_scheme"]["class"])
 			schedule_args = train_opts["lr_scheme"]["args"]
