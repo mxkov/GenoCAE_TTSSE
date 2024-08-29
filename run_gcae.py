@@ -1075,7 +1075,7 @@ if __name__ == "__main__":
 			#
 			# this condition should provide at least 1 validation run per epoch
 			# (as long as get_batches() works)
-			if batches_since_last_valid > 0.1*n_train_batches:
+			if batches_since_last_valid > 0.05*n_train_batches/num_devices:
 				#### validation block ####
 				valid_loss_this_eval, \
 				min_valid_loss, min_valid_loss_epoch, \
