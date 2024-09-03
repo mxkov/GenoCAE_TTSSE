@@ -1267,7 +1267,7 @@ if __name__ == "__main__":
 				                         batch_orig_mask)
 				loss_value_per_batch.append(loss_batch)
 
-				projected_data.update(batch_indpop, encoded_batch,
+				projected_data.update(strat, batch_indpop, encoded_batch,
 				                      decoded_batch, batch_target,
 				                      batch_orig_mask)
 

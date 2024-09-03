@@ -543,6 +543,16 @@ def alfreqvector(y_pred):
 		return tf.nn.softmax(y_pred)
 
 
+def unpack_from_replicas(strategy, *args):
+	"""Combine projected data from all devices on this worker"""
+	all_items = []
+	for item in args:
+		item_from_replicas = strategy.experimental_local_results(item)
+		item_full = tf.concat(item_from_replicas, axis=0)
+		all_items.append(item_full)
+	return (*all_items,)
+
+
 class ProjectedOutput:
 	"""Keeps track of projection results and related data for one saved epoch"""
 
@@ -589,10 +599,6 @@ class ProjectedOutput:
 
 	def _unpack_from_replicas(self, *args):
 		"""Combine projected data from all devices on this worker"""
-		# TODO: standalone function instead of class method?
-		# TODO: check out strat.experimental_local_results() instead lmao.
-		#       or maybe strat.gather().
-		# https://www.tensorflow.org/api_docs/python/tf/types/experimental/distributed/PerReplica
 		all_items = list(args)
 
 		pr_checks = [type(item)==PerReplica for item in all_items]
@@ -618,23 +624,28 @@ class ProjectedOutput:
 		return (*all_items,)
 
 
-	def update(self, ind_pop_upd, encoded_upd, decoded_upd,
+	def update(self, distrib_strategy,
+	                 ind_pop_upd, encoded_upd, decoded_upd,
 	                 targets_upd, orig_mask_upd):
 		"""Add new portion of projection results"""
 		ind_pop_upd, encoded_upd, decoded_upd, \
-		    targets_upd, orig_mask_upd = self._unpack_from_replicas(
-		    ind_pop_upd, encoded_upd, decoded_upd, targets_upd, orig_mask_upd)
+		    targets_upd, orig_mask_upd = unpack_from_replicas(
+		        distrib_strategy,
+		        ind_pop_upd, encoded_upd, decoded_upd,
+		        targets_upd, orig_mask_upd)
 
-		decoded_upd = decoded_upd[:,0:self.n_markers]
-		targets_upd = targets_upd[:,0:self.n_markers]
+		decoded_upd   = np.array(decoded_upd[:,0:self.n_markers])
+		targets_upd   = np.array(targets_upd[:,0:self.n_markers])
+		orig_mask_upd = np.array(orig_mask_upd)
 
 		if self.store is None:
 			self._do_we_store_all_outputs(encoded_upd, decoded_upd,
 			                              targets_upd, orig_mask_upd)
 
 		self.ind_pop_list = np.concatenate((self.ind_pop_list,
-		                                    ind_pop_upd), axis=0)
-		self.encoded = np.concatenate((self.encoded, encoded_upd), axis=0)
+		                                    np.array(ind_pop_upd)), axis=0)
+		self.encoded = np.concatenate((self.encoded,
+		                               np.array(encoded_upd)), axis=0)
 
 		if self.store:
 			self.decoded   = np.concatenate((self.decoded, decoded_upd), axis=0)
