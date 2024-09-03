@@ -1251,8 +1251,7 @@ if __name__ == "__main__":
 				autoencoder.load_weights(weights_file_prefix)
 
 			projected_data = ProjectedOutput(n_latent_dim, n_markers,
-			                                 n_unique_samples,
-			                                 num_workers, store=False)
+			                                 n_unique_samples, num_workers)
 
 			loss_value_per_batch = []
 			metric_gc.reset_states()

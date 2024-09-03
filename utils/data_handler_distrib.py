@@ -556,16 +556,13 @@ def unpack_from_replicas(strategy, *args):
 class ProjectedOutput:
 	"""Keeps track of projection results and related data for one saved epoch"""
 
-	def __init__(self, n_latent_dim_, n_markers_, n_total_samples_,
-	                   n_workers, store=None):
+	def __init__(self, n_latent_dim_, n_markers_, n_total_samples_, n_workers):
 		# TODO: make this multi-worker
-		# TODO: might scrap store completely
 
 		self.n_dim = n_latent_dim_
 		self.n_markers = n_markers_
 		self.n_total_samples = n_total_samples_
 		self.num_workers = n_workers
-		self.store = store
 
 		self.ind_pop_list = np.empty(shape=(0,2), dtype=str)
 		self.encoded      = np.empty((0, self.n_dim))
@@ -575,26 +572,6 @@ class ProjectedOutput:
 
 		self.metrics = dict()
 		self.not_implemented_warning_given = False
-
-
-	def _do_we_store_all_outputs(self, encoded, decoded, targets, mask, k=0.3):
-		"""Auto-determine if all outputs can be stored in memory"""
-		if k >= 1.0 or k <= 0:
-			raise ValueError("Invalid k argument: should lie between 0 and 1")
-
-		arr_sizes_per_sample = [
-		  2*50*4,  # ind_pop_list, overestimated
-		  self.n_dim * encoded.dtype.itemsize,
-		  self.n_markers * decoded.dtype.itemsize,
-		  self.n_markers * targets.dtype.itemsize,
-		  self.n_markers * mask.dtype.itemsize
-		]
-		total_size = sum(arr_sizes_per_sample) * self.n_total_samples  # bytes
-		max_ram = k*virtual_memory().available
-		if total_size > max_ram:
-			self.store = False
-		else:
-			self.store = True
 
 
 	def _unpack_from_replicas(self, *args):
@@ -638,24 +615,14 @@ class ProjectedOutput:
 		targets_upd   = np.array(targets_upd[:,0:self.n_markers])
 		orig_mask_upd = np.array(orig_mask_upd)
 
-		if self.store is None:
-			self._do_we_store_all_outputs(encoded_upd, decoded_upd,
-			                              targets_upd, orig_mask_upd)
-
 		self.ind_pop_list = np.concatenate((self.ind_pop_list,
 		                                    np.array(ind_pop_upd)), axis=0)
 		self.encoded = np.concatenate((self.encoded,
 		                               np.array(encoded_upd)), axis=0)
 
-		if self.store:
-			self.decoded   = np.concatenate((self.decoded, decoded_upd), axis=0)
-			self.targets   = np.concatenate((self.targets, targets_upd), axis=0)
-			self.orig_mask = np.concatenate((self.orig_mask, orig_mask_upd),
-			                                axis=0)
-		else:
-			self.decoded   = decoded_upd
-			self.targets   = targets_upd
-			self.orig_mask = orig_mask_upd
+		self.decoded   = decoded_upd
+		self.targets   = targets_upd
+		self.orig_mask = orig_mask_upd
 
 
 	def get_pred_and_true(self, loss_class, norm_mode):
