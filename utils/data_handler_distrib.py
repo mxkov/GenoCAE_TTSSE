@@ -12,7 +12,11 @@ import tensorflow as tf
 from tensorflow.python.distribute.values import PerReplica
 from datetime import datetime
 
+from utils.data_handler import write_h5, read_h5
+from utils.distrib_config import get_node_ids, get_node_roles, get_worker_id
+
 # TODO: backwards compatibility with PLINK / EIGENSTRAT
+
 
 class DebugReport:
 
@@ -556,13 +560,32 @@ def unpack_from_replicas(strategy, *args):
 class ProjectedOutput:
 	"""Keeps track of projection results and related data for one saved epoch"""
 
-	def __init__(self, n_latent_dim_, n_markers_, n_total_samples_, n_workers):
+	def __init__(self, n_latent_dim_, n_markers_, n_total_samples_, n_workers,
+	             epoch, outfile_prefix = "encoded_data"):
 		# TODO: make this multi-worker
 
 		self.n_dim = n_latent_dim_
 		self.n_markers = n_markers_
 		self.n_total_samples = n_total_samples_
 		self.num_workers = n_workers
+		self.epoch = epoch
+		self.outfile_prefix = outfile_prefix
+
+		self.H5_DATANAMES = {
+			"ind_pop_list" :  "ind_pop_list_train",
+			"encoded"      : f"{self.epoch}_encoded_train"
+		}
+
+		self.worker_id = get_worker_id()
+		all_workers    = get_node_ids()
+		if self.num_workers > 1:
+			self.outfile = self._get_outfile_name(self.worker_id)
+			self.all_outfiles = [self._get_outfile_name(wid)
+			                     for wid in all_workers]
+			assert self.outfile in self.all_outfiles
+		else:
+			self.outfile = self._get_outfile_name("")
+			self.all_outfiles = [self.outfile]
 
 		self.ind_pop_list = np.empty(shape=(0,2), dtype=str)
 		self.encoded      = np.empty((0, self.n_dim))
@@ -572,6 +595,12 @@ class ProjectedOutput:
 
 		self.metrics = dict()
 		self.not_implemented_warning_given = False
+
+
+	def _get_outfile_name(self, suffix):
+		if suffix is not None and len(suffix) > 0:
+			suffix = "_"+suffix
+		return f"{self.outfile_prefix}{suffix}.h5"
 
 
 	def _unpack_from_replicas(self, *args):
@@ -643,7 +672,56 @@ class ProjectedOutput:
 		return genotypes_pred, genotypes_true, genotypes_mask
 
 
-	def write(self):
-		# write to files. per-worker!
-		# maybe combine files in the end, if many workers
-		return
+	def write(self, file):
+		"""Write encoded data and indpop to file on current worker"""
+		if os.path.isfile(file):
+			existing_ind_pop_list = read_h5(file,
+			                                self.H5_DATANAMES["ind_pop_list"])
+			if not np.array_equal(existing_ind_pop_list, self.ind_pop_list):
+				self.realign()  # TODO
+		else:
+			write_h5(file, self.H5_DATANAMES["ind_pop_list"],
+			         np.array(self.ind_pop_list, dtype='S'))
+		write_h5(file, self.H5_DATANAMES["encoded"], self.encoded)
+
+
+	def _collect(self, dataname):
+		"""Read a given HDF5 dataset from all workers"""
+		if dataname not in self.H5_DATANAMES.values():
+			raise ValueError(f"dataname is {dataname} but should be one of "+
+			                 f"the following: {self.H5_DATANAMES.values()}")
+		datapieces = []
+		for file in self.all_outfiles:
+			datapiece = read_h5(file, dataname)
+			datapieces.append(datapiece)
+		data = np.concatenate(datapieces, axis=0)
+		if dataname == self.H5_DATANAMES["ind_pop_list"]:
+			self.ind_pop_list = data
+		if dataname == self.H5_DATANAMES["encoded"]:
+			self.encoded = data
+
+
+	def combine(self, cleanup=True):
+		"""Read encoded data and indpop from all workers & write to 1 file"""
+		self.write(self.outfile)
+
+		if self.num_workers == 1:
+			return self.outfile
+
+		final_outfile = self._get_outfile_name("")
+		assert final_outfile not in self.all_outfiles
+
+		_, chief_id = get_node_roles()
+		if self.worker_id != chief_id:
+			# maybe reset the data?
+			return final_outfile
+
+		for ds in self.H5_DATANAMES.values():
+			self._collect(ds)
+			self.write(final_outfile)
+
+		if cleanup:
+			for file in self.all_outfiles:
+				os.remove(file)
+		self.outfile = final_outfile
+		return final_outfile
