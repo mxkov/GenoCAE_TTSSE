@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 from datetime import datetime
 import glob
+import h5py
 from math import floor
 import numpy as np
 import os
@@ -556,6 +557,11 @@ def unpack_from_replicas(strategy, *args):
 	return (*all_items,)
 
 
+def sort_by_col(x, n):
+	"""Sort a 2D Numpy array by values in the n-th column."""
+	return x[np.argsort(x[:,n])]
+
+
 class ProjectedOutput:
 	"""Keep track of projection results and related data for one saved epoch."""
 
@@ -643,15 +649,60 @@ class ProjectedOutput:
 
 	def write(self, file):
 		"""Write encoded data and indpop to file on current worker."""
-		if os.path.isfile(file):
-			existing_ind_pop_list = read_h5(file,
-			                                self.H5_DATANAMES["ind_pop_list"])
-			if not np.array_equal(existing_ind_pop_list, self.ind_pop_list):
-				self.realign()  # TODO
-		else:
-			write_h5(file, self.H5_DATANAMES["ind_pop_list"],
-			         np.array(self.ind_pop_list, dtype='S'))
+		self._check_existing_outfile(file)
+		write_h5(file, self.H5_DATANAMES["ind_pop_list"],
+		         np.array(self.ind_pop_list, dtype='S'))
 		write_h5(file, self.H5_DATANAMES["encoded"], self.encoded)
+
+
+	def _check_existing_outfile(self, outfile):
+		"""Check if outfile already exists and if its contents are relevant."""
+		if not os.path.isfile(outfile):
+			return
+		# Possibilities for an existing outfile:
+		# a) does not contain an ind_pop_list (rename)
+		# b) contains a completely different ind_pop_list (rename)
+		# c) contains same ind_pop_list in a different order (realign)
+		try:
+			existing_ind_pop_list = read_h5(outfile,
+			                                self.H5_DATANAMES["ind_pop_list"])
+		except KeyError:
+			# a)
+			os.rename(outfile, outfile+".old")
+			return
+		if not np.array_equal(sort_by_col(existing_ind_pop_list, 0),
+		                      sort_by_col(self.ind_pop_list, 0)):
+			# b)
+			os.rename(outfile, outfile+".old")
+			return
+		if not np.array_equal(existing_ind_pop_list, self.ind_pop_list):
+			# c)
+			self._realign(outfile)
+
+
+	def _realign(self, outfile):
+		"""Sort the existing outfile and the new data so they are consistent."""
+		with h5py.File(outfile, "r") as hf:
+			datanames = list(hf.keys())
+		INDPOP_DATANAME = self.H5_DATANAMES["ind_pop_list"]
+		if INDPOP_DATANAME not in datanames:
+			return
+
+		existing_ind_pop_list = read_h5(outfile, INDPOP_DATANAME)
+		if existing_ind_pop_list.shape[0] != self.ind_pop_list.shape[0]:
+			return
+		if existing_ind_pop_list.shape[0] != self.encoded.shape[0]:
+			return
+
+		order = np.argsort(existing_ind_pop_list[:,0])
+
+		for dn in datanames:
+			data = read_h5(outfile, dn)
+			data = data[order]
+			write_h5(outfile, dn, data)
+
+		self.ind_pop_list = self.ind_pop_list[order]
+		self.encoded      = self.encoded[order]
 
 
 	def _collect(self, dataname):
