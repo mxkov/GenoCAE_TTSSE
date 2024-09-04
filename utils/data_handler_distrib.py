@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from datetime import datetime
 import glob
 from math import floor
 import numpy as np
@@ -9,8 +10,6 @@ import pyarrow.parquet as pq
 import re
 import scipy
 import tensorflow as tf
-from tensorflow.python.distribute.values import PerReplica
-from datetime import datetime
 
 from utils.data_handler import write_h5, read_h5
 from utils.distrib_config import get_node_ids, get_node_roles, get_worker_id
@@ -548,7 +547,7 @@ def alfreqvector(y_pred):
 
 
 def unpack_from_replicas(strategy, *args):
-	"""Combine projected data from all devices on this worker"""
+	"""Collect distributed values from all devices on this worker."""
 	all_items = []
 	for item in args:
 		item_from_replicas = strategy.experimental_local_results(item)
@@ -558,22 +557,18 @@ def unpack_from_replicas(strategy, *args):
 
 
 class ProjectedOutput:
-	"""Keeps track of projection results and related data for one saved epoch"""
+	"""Keep track of projection results and related data for one saved epoch."""
 
-	def __init__(self, n_latent_dim_, n_markers_, n_total_samples_, n_workers,
-	             epoch, outfile_prefix = "encoded_data"):
-		# TODO: make this multi-worker
+	def __init__(self, n_latent_dim_, n_markers_, n_workers, epoch,
+	             outfile_prefix="encoded_data"):
 
-		self.n_dim = n_latent_dim_
 		self.n_markers = n_markers_
-		self.n_total_samples = n_total_samples_
 		self.num_workers = n_workers
-		self.epoch = epoch
 		self.outfile_prefix = outfile_prefix
 
 		self.H5_DATANAMES = {
 			"ind_pop_list" :  "ind_pop_list_train",
-			"encoded"      : f"{self.epoch}_encoded_train"
+			"encoded"      : f"{epoch}_encoded_train"
 		}
 
 		self.worker_id = get_worker_id()
@@ -588,52 +583,25 @@ class ProjectedOutput:
 			self.all_outfiles = [self.outfile]
 
 		self.ind_pop_list = np.empty(shape=(0,2), dtype=str)
-		self.encoded      = np.empty((0, self.n_dim))
+		self.encoded      = np.empty((0, n_latent_dim_))
 		self.decoded      = np.empty((0, self.n_markers))
 		self.targets      = np.empty((0, self.n_markers))
 		self.orig_mask    = np.empty((0, self.n_markers))
 
-		self.metrics = dict()
-		self.not_implemented_warning_given = False
+		self._not_implemented_warning_given = False
 
 
 	def _get_outfile_name(self, suffix):
+		"""Get an .h5 filepath with stored prefix and a given suffix."""
 		if suffix is not None and len(suffix) > 0:
 			suffix = "_"+suffix
 		return f"{self.outfile_prefix}{suffix}.h5"
 
 
-	def _unpack_from_replicas(self, *args):
-		"""Combine projected data from all devices on this worker"""
-		all_items = list(args)
-
-		pr_checks = [type(item)==PerReplica for item in all_items]
-		one_replica   = not any(pr_checks)
-		many_replicas = all(pr_checks)
-		assert one_replica or many_replicas
-
-		if one_replica:
-			all_items = [np.array(item) for item in all_items]
-			return (*all_items,)
-
-		# list of PerReplica`s -> list of tuples:
-		all_items = [item.values for item in all_items]
-
-		replica_counts = [len(item) for item in all_items]
-		assert all([c==replica_counts[0] for c in replica_counts[1:]])
-		num_replicas = replica_counts[0]
-
-		# list of tuples -> list of numpy.ndarray`s:
-		all_items = [np.concatenate([np.array(a) for a in item], axis=0)
-		             for item in all_items]
-
-		return (*all_items,)
-
-
 	def update(self, distrib_strategy,
 	                 ind_pop_upd, encoded_upd, decoded_upd,
 	                 targets_upd, orig_mask_upd):
-		"""Add new portion of projection results"""
+		"""Add new portion of projection results."""
 		ind_pop_upd, encoded_upd, decoded_upd, \
 		    targets_upd, orig_mask_upd = unpack_from_replicas(
 		        distrib_strategy,
@@ -655,6 +623,7 @@ class ProjectedOutput:
 
 
 	def get_pred_and_true(self, loss_class, norm_mode):
+		"""Get predicted and true genotypes for metric calculation."""
 		if (  loss_class in ("CategoricalCrossentropy", "KLDivergence")
 		   and norm_mode == "genotypewise01"):
 			genotypes_pred = tf.argmax(alfreqvector(self.decoded), axis=-1)
@@ -665,15 +634,15 @@ class ProjectedOutput:
 			genotypes_pred = np.array([])
 			genotypes_true = np.array([])
 			genotypes_mask = np.array([])
-			if not self.not_implemented_warning_given:
+			if not self._not_implemented_warning_given:
 				print("Genotype prediction not implemented for " +
 				     f"loss {loss_class} and normalization {norm_mode}.")
-				self.not_implemented_warning_given = True
+				self._not_implemented_warning_given = True
 		return genotypes_pred, genotypes_true, genotypes_mask
 
 
 	def write(self, file):
-		"""Write encoded data and indpop to file on current worker"""
+		"""Write encoded data and indpop to file on current worker."""
 		if os.path.isfile(file):
 			existing_ind_pop_list = read_h5(file,
 			                                self.H5_DATANAMES["ind_pop_list"])
@@ -686,7 +655,7 @@ class ProjectedOutput:
 
 
 	def _collect(self, dataname):
-		"""Read a given HDF5 dataset from all workers"""
+		"""Read a given HDF5 dataset from all workers."""
 		if dataname not in self.H5_DATANAMES.values():
 			raise ValueError(f"dataname is {dataname} but should be one of "+
 			                 f"the following: {self.H5_DATANAMES.values()}")
@@ -702,7 +671,7 @@ class ProjectedOutput:
 
 
 	def combine(self, cleanup=True):
-		"""Read encoded data and indpop from all workers & write to 1 file"""
+		"""Read encoded data and indpop from all workers & write to 1 file."""
 		self.write(self.outfile)
 
 		if self.num_workers == 1:
