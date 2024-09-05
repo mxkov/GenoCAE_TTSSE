@@ -400,7 +400,10 @@ def project_step_distrib(model_, loss_function_, input_, targets_, mask_):
 	                                        input_, targets_, mask_))
 	loss = strat.reduce("SUM", per_replica_losses, axis=None)
 	return loss, per_replica_decoded, per_replica_encoded
-	# TODO: check out strat.experimental_local_results()
+
+@tf.function
+def update_metric_distrib(metric, *args):
+	strat.run(metric.update_state, args=(*args,))
 
 
 def get_batches(n_samples, batch_size):
@@ -499,7 +502,7 @@ if __name__ == "__main__":
 		arguments[knew]=arg
 
 
-	many_workers_needed = True if arguments["train"] else False
+	many_workers_needed = True if (arguments["train"] or arguments["project"]) else False
 	strat, num_workers, end_current_worker = define_distribution_strategy(
 	                                   multiworker_needed = many_workers_needed)
 	isChief = _isChief()
@@ -1154,10 +1157,6 @@ if __name__ == "__main__":
 
 	if arguments['project']:
 		# TODO: the 'train' suffix in this section is confusing.
-		if not isChief:
-			print("Work has ended for this worker")
-			exit(0)
-		# TODO: implement multi-worker projecting someday
 
 		ae_weight_manager = WeightKeeper(train_directory)
 		projected_epochs = get_projected_epochs(encoded_data_file)
@@ -1198,17 +1197,6 @@ if __name__ == "__main__":
 		dds_proj = strat.distribute_datasets_from_function(
 		                    lambda x: dg.create_dataset_from_pq(x, split="all"))
 
-		metric_gc = GenotypeConcordance()
-		# Don't know how to handle a distribured metric.
-		# But I can calc it in a non-distributed manner anyway.
-		# So it should be outside strat scope.
-
-		# TODO: we don't need strat scope in this section,
-		#       we terminated all non-chief workers already...
-		#       also global batch size is too much
-		# TODO: actually we do need the strat.
-		#       so we can properly finalize the dataset.
-		#       AND for mutli-GPU cases actually.
 		with strat.scope():
 			autoencoder = Autoencoder(model_architecture, n_markers,
 			                          noise_std, regularizer)
@@ -1229,6 +1217,8 @@ if __name__ == "__main__":
 				loss = tf.nn.compute_average_loss(per_example_loss)
 				loss += tf.nn.scale_regularization_loss(sum(model_losses))
 				return loss
+
+			metric_gc = GenotypeConcordance()
 
 		# loss function of the train set per epoch
 		losses_train = []
@@ -1275,8 +1265,8 @@ if __name__ == "__main__":
 				genos_pred, genos_true, genos_mask = \
 				   projected_data.get_pred_and_true(train_opts["loss"]["class"],
 				                                    data_opts["norm_mode"])
-
-				metric_gc.update_state(genos_true, genos_pred, genos_mask)
+				update_metric_distrib(metric_gc,
+				                      genos_pred, genos_true, genos_mask)
 
 				batch_count_proj += 1
 				if (max_batches_train is not None
@@ -1291,6 +1281,8 @@ if __name__ == "__main__":
 			print(f"Genotype concordance: {gc_this_epoch}")
 
 			encoded_data_file = projected_data.combine()
+			if not isChief:
+				continue
 
 			if epoch == epochs[0]:
 				#assert len(projected_data.ind_pop_list) == dg.n_total_samples, \
@@ -1337,6 +1329,13 @@ if __name__ == "__main__":
 					plot_coords(projected_data.encoded,
 					            os.path.join(results_directory,
 					                         f"dimred_e_{epoch}"))
+
+		timenow = f"{datetime.now().time()}"
+		if isChief:
+			print(f"Terminating workers on {timenow}")
+		else:
+			print(f"Work has ended for this worker on {timenow}")
+			exit(0)
 
 		######## TRUE GENOS
 		if False: # TODO
