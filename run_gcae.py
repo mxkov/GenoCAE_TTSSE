@@ -647,7 +647,8 @@ if __name__ == "__main__":
 	except OSError:
 		pass
 
-	encoded_data_file = os.path.join(train_directory, pdata, "encoded_data.h5")
+	encoded_data_pref = os.path.join(train_directory, pdata, "encoded_data")
+	encoded_data_file = encoded_data_pref + ".h5"
 
 	if "noise_std" in train_opts.keys():
 		noise_std = train_opts["noise_std"]
@@ -1251,7 +1252,8 @@ if __name__ == "__main__":
 				autoencoder.load_weights(weights_file_prefix)
 
 			projected_data = ProjectedOutput(n_latent_dim, n_markers,
-			                                 n_unique_samples, num_workers)
+			                                 num_workers, epoch,
+			                                 outfile_prefix=encoded_data_pref)
 
 			loss_value_per_batch = []
 			metric_gc.reset_states()
@@ -1288,6 +1290,8 @@ if __name__ == "__main__":
 			genotype_concs_train.append(gc_this_epoch)
 			print(f"Genotype concordance: {gc_this_epoch}")
 
+			encoded_data_file = projected_data.combine()
+
 			if epoch == epochs[0]:
 				#assert len(projected_data.ind_pop_list) == dg.n_total_samples, \
 				#       f"{len(projected_data.ind_pop_list)} vs {dg.n_total_samples}"
@@ -1298,10 +1302,6 @@ if __name__ == "__main__":
 					print(f"MISMATCH in ind_pop_list: {len(projected_data.ind_pop_list)} vs {dg.n_total_samples}")
 				if len(projected_data.encoded) != dg.n_total_samples:
 					print(f"MISMATCH in encoded: {len(projected_data.encoded)} vs {dg.n_total_samples}")
-
-				write_h5(encoded_data_file, "ind_pop_list_train",
-				         np.array(projected_data.ind_pop_list, dtype='S'))
-
 
 			if superpopulations_file:
 				# TODO: might have to reimplement all these functions from the old data handler,
@@ -1337,8 +1337,6 @@ if __name__ == "__main__":
 					plot_coords(projected_data.encoded,
 					            os.path.join(results_directory,
 					                         f"dimred_e_{epoch}"))
-
-			write_h5(encoded_data_file, f"{epoch}_encoded_train", projected_data.encoded)
 
 		######## TRUE GENOS
 		if False: # TODO

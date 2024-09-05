@@ -563,7 +563,17 @@ def sort_by_col(x, n):
 
 
 class ProjectedOutput:
-	"""Keep track of projection results and related data for one saved epoch."""
+	"""Keep track of projection results and related data for one saved epoch.
+	
+	How to use:
+	1) Instantiate before projecting.
+	2) Loop over batches, call self.update() to update with model output
+	   from every batch;
+	   if needed, call self.get_pred_and_true() every batch.
+	3) After the loop, call self.combine().
+	   The combined outputs will be written to final_outfile
+	   and kept in the object on the chief worker only.
+	"""
 
 	def __init__(self, n_latent_dim_, n_markers_, n_workers, epoch,
 	             outfile_prefix="encoded_data"):
