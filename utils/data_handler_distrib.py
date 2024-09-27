@@ -11,9 +11,10 @@ import pyarrow.parquet as pq
 import re
 import scipy
 import tensorflow as tf
+import warnings
 
 from utils.data_handler import write_h5, read_h5
-from utils.distrib_config import get_node_ids, get_node_roles, get_worker_id
+from utils.distrib_config import get_node_roles, get_worker_id
 
 # TODO: backwards compatibility with PLINK / EIGENSTRAT
 
@@ -547,13 +548,19 @@ def alfreqvector(y_pred):
 		return tf.nn.softmax(y_pred)
 
 
-def unpack_from_replicas(strategy, *args):
+def unpack_from_local_replicas(strategy, *args):
 	"""Collect distributed values from all devices on this worker."""
 	all_items = []
 	for item in args:
 		item_from_replicas = strategy.experimental_local_results(item)
 		item_full = tf.concat(item_from_replicas, axis=0)
 		all_items.append(item_full)
+	return (*all_items,)
+
+
+def unpack_from_all_replicas(strategy, *args):
+	"""Collect distributed values from all devices across all workers."""
+	all_items = [strategy.gather(item, axis=0) for item in args]
 	return (*all_items,)
 
 
@@ -567,36 +574,27 @@ class ProjectedOutput:
 	
 	How to use:
 	1) Instantiate before projecting.
-	2) Loop over batches, call self.update() to update with model output
-	   from every batch;
-	   if needed, call self.get_pred_and_true() every batch.
-	3) After the loop, call self.combine().
-	   The combined outputs will be written to final_outfile
-	   and kept in the object on the chief worker only.
+	2) Loop over batches, call method update() to update with model output
+	   and projection results from every batch;
+	   if needed, call method get_pred_and_true() every batch.
+	3) After the loop, call method write() to write the combined projection
+	   results (encoded & indpop list) to outfile.
 	"""
 
-	def __init__(self, n_latent_dim_, n_markers_, n_workers, epoch,
+	def __init__(self, n_latent_dim_, n_markers_, epoch,
 	             outfile_prefix="encoded_data"):
 
 		self.n_markers = n_markers_
-		self.num_workers = n_workers
-		self.outfile_prefix = outfile_prefix
+		self.outfile = outfile_prefix+".h5"
 
 		self.H5_DATANAMES = {
 			"ind_pop_list" :  "ind_pop_list_train",
 			"encoded"      : f"{epoch}_encoded_train"
 		}
 
+		_, chief_id    = get_node_roles()
 		self.worker_id = get_worker_id()
-		all_workers    = get_node_ids()
-		if self.num_workers > 1:
-			self.outfile = self._get_outfile_name(self.worker_id)
-			self.all_outfiles = [self._get_outfile_name(wid)
-			                     for wid in all_workers]
-			assert self.outfile in self.all_outfiles
-		else:
-			self.outfile = self._get_outfile_name("")
-			self.all_outfiles = [self.outfile]
+		self._is_chief = (self.worker_id == chief_id)
 
 		self.ind_pop_list = np.empty(shape=(0,2), dtype=str)
 		self.encoded      = np.empty((0, n_latent_dim_))
@@ -604,42 +602,41 @@ class ProjectedOutput:
 		self.targets      = np.empty((0, self.n_markers))
 		self.orig_mask    = np.empty((0, self.n_markers))
 
-		self._not_implemented_warning_given = False
-
-
-	def _get_outfile_name(self, suffix):
-		"""Get an .h5 filepath with stored prefix and a given suffix."""
-		if suffix is not None and len(suffix) > 0:
-			suffix = "_"+suffix
-		return f"{self.outfile_prefix}{suffix}.h5"
+		self._not_implemented_params = []
 
 
 	def update(self, distrib_strategy,
 	                 ind_pop_upd, encoded_upd, decoded_upd,
 	                 targets_upd, orig_mask_upd):
-		"""Add new portion of projection results."""
-		ind_pop_upd, encoded_upd, decoded_upd, \
-		    targets_upd, orig_mask_upd = unpack_from_replicas(
-		        distrib_strategy,
-		        ind_pop_upd, encoded_upd, decoded_upd,
-		        targets_upd, orig_mask_upd)
+		"""Add new portion of projection results.
 
-		decoded_upd   = np.array(decoded_upd[:,0:self.n_markers])
-		targets_upd   = np.array(targets_upd[:,0:self.n_markers])
-		orig_mask_upd = np.array(orig_mask_upd)
+		Decoded, targets, mask are stored on each worker, come from the latest
+		batch on all devices on this worker, and are rewritten every batch.
+		Indpop list and encoded from all workers are stored on chief worker only
+		and accumulate over batches."""
+		decoded_upd, targets_upd, orig_mask_upd = unpack_from_local_replicas(
+		    distrib_strategy,
+		    decoded_upd, targets_upd, orig_mask_upd)
+
+		self.decoded   = np.array(decoded_upd[:,0:self.n_markers])
+		self.targets   = np.array(targets_upd[:,0:self.n_markers])
+		self.orig_mask = np.array(orig_mask_upd)
+
+		if not self._is_chief:
+			return
+
+		ind_pop_upd, encoded_upd = unpack_from_all_replicas(
+		    distrib_strategy,
+		    ind_pop_upd, encoded_upd)
 
 		self.ind_pop_list = np.concatenate((self.ind_pop_list,
 		                                    np.array(ind_pop_upd)), axis=0)
 		self.encoded = np.concatenate((self.encoded,
 		                               np.array(encoded_upd)), axis=0)
 
-		self.decoded   = decoded_upd
-		self.targets   = targets_upd
-		self.orig_mask = orig_mask_upd
-
 
 	def get_pred_and_true(self, loss_class, norm_mode):
-		"""Get predicted and true genotypes for metric calculation."""
+		"""Get predicted and true genotypes from last batch on current worker."""
 		if (  loss_class in ("CategoricalCrossentropy", "KLDivergence")
 		   and norm_mode == "genotypewise01"):
 			genotypes_pred = tf.argmax(alfreqvector(self.decoded), axis=-1)
@@ -650,19 +647,21 @@ class ProjectedOutput:
 			genotypes_pred = np.array([])
 			genotypes_true = np.array([])
 			genotypes_mask = np.array([])
-			if not self._not_implemented_warning_given:
-				print("Genotype prediction not implemented for " +
-				     f"loss {loss_class} and normalization {norm_mode}.")
-				self._not_implemented_warning_given = True
+			if (loss_class, norm_mode) not in self._not_implemented_params:
+				warnings.warn("Genotype prediction not implemented for loss " +
+				             f"{loss_class} and normalization {norm_mode}.")
+				self._not_implemented_params.append((loss_class, norm_mode))
 		return genotypes_pred, genotypes_true, genotypes_mask
 
 
-	def write(self, file):
-		"""Write encoded data and indpop to file on current worker."""
-		self._check_existing_outfile(file)
-		write_h5(file, self.H5_DATANAMES["ind_pop_list"],
+	def write(self):
+		"""Write encoded data and indpop list to outfile on the chief worker."""
+		if not self._is_chief:
+			return
+		self._check_existing_outfile(self.outfile)
+		write_h5(self.outfile, self.H5_DATANAMES["ind_pop_list"],
 		         np.array(self.ind_pop_list, dtype='S'))
-		write_h5(file, self.H5_DATANAMES["encoded"], self.encoded)
+		write_h5(self.outfile, self.H5_DATANAMES["encoded"], self.encoded)
 
 
 	def _check_existing_outfile(self, outfile):
@@ -693,9 +692,9 @@ class ProjectedOutput:
 	def _realign(self, outfile):
 		"""Sort the existing outfile and the new data so they are consistent."""
 		with h5py.File(outfile, "r") as hf:
-			datanames = list(hf.keys())
+			existing_datanames = list(hf.keys())
 		INDPOP_DATANAME = self.H5_DATANAMES["ind_pop_list"]
-		if INDPOP_DATANAME not in datanames:
+		if INDPOP_DATANAME not in existing_datanames:
 			return
 
 		existing_ind_pop_list = read_h5(outfile, INDPOP_DATANAME)
@@ -706,52 +705,10 @@ class ProjectedOutput:
 
 		order = np.argsort(existing_ind_pop_list[:,0])
 
-		for dn in datanames:
+		for dn in existing_datanames:
 			data = read_h5(outfile, dn)
 			data = data[order]
 			write_h5(outfile, dn, data)
 
 		self.ind_pop_list = self.ind_pop_list[order]
 		self.encoded      = self.encoded[order]
-
-
-	def _collect(self, dataname):
-		"""Read a given HDF5 dataset from all workers."""
-		if dataname not in self.H5_DATANAMES.values():
-			raise ValueError(f"dataname is {dataname} but should be one of "+
-			                 f"the following: {self.H5_DATANAMES.values()}")
-		datapieces = []
-		for file in self.all_outfiles:
-			datapiece = read_h5(file, dataname)
-			datapieces.append(datapiece)
-		data = np.concatenate(datapieces, axis=0)
-		if dataname == self.H5_DATANAMES["ind_pop_list"]:
-			self.ind_pop_list = data
-		if dataname == self.H5_DATANAMES["encoded"]:
-			self.encoded = data
-
-
-	def combine(self, cleanup=True):
-		"""Read encoded data and indpop from all workers & write to 1 file."""
-		self.write(self.outfile)
-
-		if self.num_workers == 1:
-			return self.outfile
-
-		final_outfile = self._get_outfile_name("")
-		assert final_outfile not in self.all_outfiles
-
-		_, chief_id = get_node_roles()
-		if self.worker_id != chief_id:
-			# maybe reset the data?
-			return final_outfile
-
-		for ds in self.H5_DATANAMES.values():
-			self._collect(ds)
-			self.write(final_outfile)
-
-		if cleanup:
-			for file in self.all_outfiles:
-				os.remove(file)
-		self.outfile = final_outfile
-		return final_outfile

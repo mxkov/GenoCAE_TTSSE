@@ -1241,8 +1241,7 @@ if __name__ == "__main__":
 			with strat.scope():
 				autoencoder.load_weights(weights_file_prefix)
 
-			projected_data = ProjectedOutput(n_latent_dim, n_markers,
-			                                 num_workers, epoch,
+			projected_data = ProjectedOutput(n_latent_dim, n_markers, epoch,
 			                                 outfile_prefix=encoded_data_pref)
 
 			loss_value_per_batch = []
@@ -1280,8 +1279,10 @@ if __name__ == "__main__":
 			genotype_concs_train.append(gc_this_epoch)
 			print(f"Genotype concordance: {gc_this_epoch}")
 
-			encoded_data_file = projected_data.combine()
+			projected_data.write()
+			encoded_data_file = projected_data.outfile
 			if not isChief:
+				# TODO: wait until the chief is done with plotting?
 				continue
 
 			if epoch == epochs[0]:
