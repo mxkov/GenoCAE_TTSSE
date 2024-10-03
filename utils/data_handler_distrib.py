@@ -92,6 +92,7 @@ class DataGenerator:
 
 		if self._debug:
 			self.debug_report = DebugReport()
+			# TODO: proper logging
 
 		self._get_ind_pop_list()
 		self._get_n_markers()
@@ -173,9 +174,6 @@ class DataGenerator:
 			start = end
 			assert len(self.sample_idx_all[f]) == self.samples_per_file[f]
 
-		self.ind_pop_list_train = np.copy(self.ind_pop_list)
-		self.ind_pop_list_valid = np.empty(shape=(0,2), dtype=str)
-
 
 	def define_validation_set(self, validation_split, random_state=None):
 		# TODO: should be stratified by population in the general case
@@ -202,12 +200,11 @@ class DataGenerator:
 
 		assert self.n_train_samples == self.n_total_samples-self.n_valid_samples
 
-		sample_idx_train_all = np.concatenate([self.sample_idx_train[f]
-		                                       for f in self.filelist], axis=0)
-		sample_idx_valid_all = np.concatenate([self.sample_idx_valid[f]
-		                                       for f in self.filelist], axis=0)
-		self.ind_pop_list_train=np.copy(self.ind_pop_list[sample_idx_train_all,:])
-		self.ind_pop_list_valid=np.copy(self.ind_pop_list[sample_idx_valid_all,:])
+
+	def get_indpop_from_idx(self, sample_idx):
+		"""Retrieve individual+population labels for given sample indices"""
+		indpop = np.copy(self.ind_pop_list[sample_idx,:])
+		return indpop
 
 
 	def create_dataset_from_pq(self, input_context, split="all"):
@@ -225,11 +222,12 @@ class DataGenerator:
 				# genotypes
 				tf.TensorSpec(shape=(None, self.n_markers),
 				              dtype=tf.as_dtype(self.geno_dtype)),
-				# ind/pop
-				tf.TensorSpec(shape=(None, 2), dtype=tf.string),
+				# sample indices
+				tf.TensorSpec(shape=(None), dtype=tf.int64),
 				# genotypes shape
 				tf.TensorSpec(shape=(2,), dtype=tf.int64),
 				# last batch flag
+				# TODO: this element might not be needed anymore
 				tf.TensorSpec(shape=(1,), dtype=tf.bool)
 			)
 			gen_args = (files, split, batch_size,
@@ -306,9 +304,9 @@ class DataGenerator:
 			                 "must be 'all', 'train' or 'valid'")
 		cur_sample_idx = np.concatenate([cur_sample_idx_per_file[f]
 		                                 for f in filepaths], axis=0)
-		cur_ind_pop_list = np.copy(self.ind_pop_list[cur_sample_idx,:])
 
 		if self._debug:
+		# TODO: this shouldn't be here, do proper logging
 			try:
 				jid = os.environ["SLURM_JOB_ID"]
 				wid = os.environ["SLURMD_NODENAME"]
@@ -322,9 +320,10 @@ class DataGenerator:
 			             f" {filepaths}\n")
 			pqreport.write(pqreport_file, mode="a")
 
-		pqds = open_parquets(filepaths, inds_fam = cur_ind_pop_list[:,0])
+		pqds = open_parquets(filepaths,
+		                     inds_fam = self.ind_pop_list[cur_sample_idx,0])
 
-		cur_sample_idx = tf.cast(cur_sample_idx, tf.int32)
+		cur_sample_idx = tf.cast(cur_sample_idx, tf.int64)
 		if shuffle_:
 			cur_sample_idx = tf.random.shuffle(cur_sample_idx)
 		n_samples = len(cur_sample_idx)
@@ -349,9 +348,7 @@ class DataGenerator:
 			chunk_idx = cur_sample_idx[start:end]
 			# Last chunk does not necessarily contain chunk_size samples!
 
-			chunk_indpop = self.ind_pop_list[chunk_idx,:]
-			# chunk_indpop = cur_ind_pop_list[chunk_idx,:] -??
-			inds_to_read = list(chunk_indpop[:,0])
+			inds_to_read = list(self.ind_pop_list[chunk_idx,0])
 			chunk = pqds.read(columns = inds_to_read,
 			                  use_threads = True,  # TODO: try without
 			                  use_pandas_metadata = False)
@@ -374,7 +371,7 @@ class DataGenerator:
 				end_   = gen_batch_size *(batches_read+1)
 
 				batch_genos  = chunk[start_:end_,:]
-				batch_indpop = chunk_indpop[start_:end_,:]
+				batch_idx    = chunk_idx[start_:end_]
 				if end_ >= chunk.shape[0]:
 					last_batch_in_chunk = True
 
@@ -384,7 +381,7 @@ class DataGenerator:
 				total_batch_count += 1
 				total_sample_count += batch_genos.shape[0]
 
-				yield batch_genos, batch_indpop, \
+				yield batch_genos, batch_idx, \
 				      batch_genos.shape, np.array([last_batch_in_chunk])
 
 		if self._debug:
@@ -394,7 +391,7 @@ class DataGenerator:
 			pqreport.write(pqreport_file, mode="a")
 
 
-	def _normalize(self, genos, indpop, genos_shape, *args):
+	def _normalize(self, genos, sample_idx, genos_shape, *args):
 		"""normalize and insert missing value"""
 
 		where_missing = tf.where(genos==9)
@@ -432,10 +429,10 @@ class DataGenerator:
 			raise ValueError("Unknown normalization mode: "+
 			                f"{self.normalization_mode}")
 
-		return genos, indpop, genos_shape, *args
+		return genos, sample_idx, genos_shape, *args
 
 
-	def _mask_and_sparsify(self, genos, indpop, genos_shape, *args):
+	def _mask_and_sparsify(self, genos, sample_idx, genos_shape, *args):
 
 		sparsify = False
 		if len(self.sparsifies) > 0:
@@ -448,8 +445,9 @@ class DataGenerator:
 
 		if not sparsify and not self.missing_mask:
 			inputs = tf.expand_dims(genos, axis=-1)
-			mask   = tf.cast(mask, tf.bool)
-			return inputs, genos, mask, indpop, *args
+			mask   = tf.cast(mask, tf.int32)
+			# bool won't work with strategy.gather
+			return inputs, genos, mask, sample_idx, *args
 			# this branch should return the same number of elements
 			# as the main body.
 			# esp bc self.sparsifies may contain both zeros and non-zeros.
@@ -478,10 +476,11 @@ class DataGenerator:
 		else:
 			inputs = tf.expand_dims(inputs, axis=-1)
 
-		orig_mask = tf.cast(orig_mask, tf.bool)
+		orig_mask = tf.cast(orig_mask, tf.int32)
+		# bool won't work with strategy.gather
 
 		# genos will serve as targets
-		return inputs, genos, orig_mask, indpop, *args
+		return inputs, genos, orig_mask, sample_idx, *args
 
 
 def get_most_common_genotypes(genos_):
@@ -548,6 +547,7 @@ def alfreqvector(y_pred):
 		return tf.nn.softmax(y_pred)
 
 
+@tf.function
 def unpack_from_local_replicas(strategy, *args):
 	"""Collect distributed values from all devices on this worker."""
 	all_items = []
@@ -557,7 +557,7 @@ def unpack_from_local_replicas(strategy, *args):
 		all_items.append(item_full)
 	return (*all_items,)
 
-
+@tf.function
 def unpack_from_all_replicas(strategy, *args):
 	"""Collect distributed values from all devices across all workers."""
 	all_items = [strategy.gather(item, axis=0) for item in args]
@@ -573,20 +573,24 @@ class ProjectedOutput:
 	"""Keep track of projection results and related data for one saved epoch.
 	
 	How to use:
-	1) Instantiate before projecting.
+	1) Instantiate before projecting each saved epoch.
 	2) Loop over batches, call method update() to update with model output
 	   and projection results from every batch;
 	   if needed, call method get_pred_and_true() every batch.
-	3) After the loop, call method write() to write the combined projection
-	   results (encoded & indpop list) to outfile.
+	3) After the loop, get individual & population labels for the sample indices
+	   stored in attribute sample_idx, for example using DataGenerator method
+	   get_indpop_from_idx().
+	4) With these labels, call method write() to write the combined projection
+	   results to outfile.
 	"""
 
 	def __init__(self, n_latent_dim_, n_markers_, epoch,
 	             outfile_prefix="encoded_data"):
 
+		self.n_latent_dim = n_latent_dim_
 		self.n_markers = n_markers_
-		self.outfile = outfile_prefix+".h5"
 
+		self.outfile = outfile_prefix+".h5"
 		self.H5_DATANAMES = {
 			"ind_pop_list" :  "ind_pop_list_train",
 			"encoded"      : f"{epoch}_encoded_train"
@@ -596,41 +600,43 @@ class ProjectedOutput:
 		self.worker_id = get_worker_id()
 		self._is_chief = (self.worker_id == chief_id)
 
-		self.ind_pop_list = np.empty(shape=(0,2), dtype=str)
-		self.encoded      = np.empty((0, n_latent_dim_))
-		self.decoded      = np.empty((0, self.n_markers))
-		self.targets      = np.empty((0, self.n_markers))
-		self.orig_mask    = np.empty((0, self.n_markers))
+		self.ind_pop_list = None
+		self.sample_idx   = np.empty((0,), dtype=np.int64)
+		self.encoded      = np.empty((0, self.n_latent_dim))
+
+		self.decoded      = tf.zeros([0, self.n_markers])
+		self.targets      = tf.zeros([0, self.n_markers])
+		self.orig_mask    = tf.zeros([0, self.n_markers], dtype=tf.int32)
 
 		self._not_implemented_params = []
 
 
 	def update(self, distrib_strategy,
-	                 ind_pop_upd, encoded_upd, decoded_upd,
+	                 sample_idx_upd, encoded_upd, decoded_upd,
 	                 targets_upd, orig_mask_upd):
 		"""Add new portion of projection results.
 
 		Decoded, targets, mask are stored on each worker, come from the latest
 		batch on all devices on this worker, and are rewritten every batch.
-		Indpop list and encoded from all workers are stored on chief worker only
-		and accumulate over batches."""
+		Sample indices and encoded from all workers are stored on chief worker
+		only and accumulate over batches."""
 		decoded_upd, targets_upd, orig_mask_upd = unpack_from_local_replicas(
 		    distrib_strategy,
 		    decoded_upd, targets_upd, orig_mask_upd)
 
-		self.decoded   = np.array(decoded_upd[:,0:self.n_markers])
-		self.targets   = np.array(targets_upd[:,0:self.n_markers])
-		self.orig_mask = np.array(orig_mask_upd)
+		self.decoded   = decoded_upd[:,0:self.n_markers]
+		self.targets   = targets_upd[:,0:self.n_markers]
+		self.orig_mask = orig_mask_upd
+
+		sample_idx_upd, encoded_upd = unpack_from_all_replicas(
+		    distrib_strategy,
+		    sample_idx_upd, encoded_upd)
 
 		if not self._is_chief:
 			return
 
-		ind_pop_upd, encoded_upd = unpack_from_all_replicas(
-		    distrib_strategy,
-		    ind_pop_upd, encoded_upd)
-
-		self.ind_pop_list = np.concatenate((self.ind_pop_list,
-		                                    np.array(ind_pop_upd)), axis=0)
+		self.sample_idx = np.concatenate((self.sample_idx,
+		                                  np.array(sample_idx_upd)))
 		self.encoded = np.concatenate((self.encoded,
 		                               np.array(encoded_upd)), axis=0)
 
@@ -644,9 +650,9 @@ class ProjectedOutput:
 			genotypes_true = tf.cast(self.targets, tf.float16)
 			genotypes_mask = tf.cast(self.orig_mask, tf.bool)
 		else:
-			genotypes_pred = np.array([])
-			genotypes_true = np.array([])
-			genotypes_mask = np.array([])
+			genotypes_pred = tf.zeros([])
+			genotypes_true = tf.zeros([])
+			genotypes_mask = tf.zeros([])
 			if (loss_class, norm_mode) not in self._not_implemented_params:
 				warnings.warn("Genotype prediction not implemented for loss " +
 				             f"{loss_class} and normalization {norm_mode}.")
@@ -654,13 +660,14 @@ class ProjectedOutput:
 		return genotypes_pred, genotypes_true, genotypes_mask
 
 
-	def write(self):
-		"""Write encoded data and indpop list to outfile on the chief worker."""
+	def write(self, ind_pop_list):
+		"""Write encoded data & ind_pop_list to outfile on the chief worker."""
 		if not self._is_chief:
 			return
+		self.ind_pop_list = np.array(ind_pop_list, dtype="S")
 		self._check_existing_outfile(self.outfile)
 		write_h5(self.outfile, self.H5_DATANAMES["ind_pop_list"],
-		         np.array(self.ind_pop_list, dtype='S'))
+		         self.ind_pop_list)
 		write_h5(self.outfile, self.H5_DATANAMES["encoded"], self.encoded)
 
 
@@ -675,6 +682,7 @@ class ProjectedOutput:
 		try:
 			existing_ind_pop_list = read_h5(outfile,
 			                                self.H5_DATANAMES["ind_pop_list"])
+			existing_ind_pop_list = np.array(existing_ind_pop_list, dtype="S")
 		except KeyError:
 			# a)
 			os.rename(outfile, outfile+".old")

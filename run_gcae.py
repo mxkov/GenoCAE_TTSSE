@@ -853,6 +853,7 @@ if __name__ == "__main__":
 				# empty batches STILL produce errors in other places,
 				# e.g. PredictLoss(). Handle them BEFORE they get there.
 				if not fill_missing:
+					orig_nonmissing_mask = tf.cast(orig_nonmissing_mask, tf.bool)
 					y_pred = y_pred[orig_nonmissing_mask]
 					y_true = y_true[orig_nonmissing_mask]
 				
@@ -1209,6 +1210,7 @@ if __name__ == "__main__":
 				y_true = tf.one_hot(tf.cast(y_true*2, tf.uint8), 3)*0.9997 + 0.0001
 				
 				if not fill_missing:
+					orig_nonmissing_mask = tf.cast(orig_nonmissing_mask, tf.bool)
 					y_pred = y_pred[orig_nonmissing_mask]
 					y_true = y_true[orig_nonmissing_mask]
 				
@@ -1249,7 +1251,7 @@ if __name__ == "__main__":
 			batch_count_proj = 0
 
 			for batch_input, batch_target,\
-			    batch_orig_mask, batch_indpop, _ in dds_proj:
+			    batch_orig_mask, batch_sample_idx, _ in dds_proj:
 
 				loss_batch, decoded_batch, encoded_batch = \
 				    project_step_distrib(autoencoder, loss_func,
@@ -1257,7 +1259,7 @@ if __name__ == "__main__":
 				                         batch_orig_mask)
 				loss_value_per_batch.append(loss_batch)
 
-				projected_data.update(strat, batch_indpop, encoded_batch,
+				projected_data.update(strat, batch_sample_idx, encoded_batch,
 				                      decoded_batch, batch_target,
 				                      batch_orig_mask)
 
@@ -1279,7 +1281,8 @@ if __name__ == "__main__":
 			genotype_concs_train.append(gc_this_epoch)
 			print(f"Genotype concordance: {gc_this_epoch}")
 
-			projected_data.write()
+			ind_pop_list_proj= dg.get_indpop_from_idx(projected_data.sample_idx)
+			projected_data.write(ind_pop_list = ind_pop_list_proj)
 			encoded_data_file = projected_data.outfile
 			if not isChief:
 				# TODO: wait until the chief is done with plotting?
