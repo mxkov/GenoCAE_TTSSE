@@ -37,9 +37,7 @@ Options:
 
 from docopt import docopt, DocoptExit
 import tensorflow as tf
-import tensorflow.distribute as tfd
-import tensorflow.distribute.experimental as tfde
-from tensorflow.keras import Model, layers
+from tensorflow.keras import Model
 from tensorflow.python.distribute.values import PerReplica
 from datetime import datetime
 from utils.data_handler_distrib import (
@@ -48,14 +46,13 @@ from utils.data_handler_distrib import (
 	alfreqvector
 )
 # TODO: look into reimplementing all these below as well:
-from utils.data_handler import get_saved_epochs, get_projected_epochs, write_h5, read_h5, get_coords_by_pop, convex_hull_error, f1_score_kNN, plot_genotype_hist, to_genotypes_sigmoid_round, to_genotypes_invscale_round, get_pops_with_k, get_ind_pop_list_from_map, get_baseline_gc, write_metric_per_epoch_to_csv
+from utils.data_handler import get_saved_epochs, get_projected_epochs, read_h5, get_coords_by_pop, convex_hull_error, f1_score_kNN, plot_genotype_hist, to_genotypes_sigmoid_round, to_genotypes_invscale_round, get_pops_with_k, get_ind_pop_list_from_map, get_baseline_gc, write_metric_per_epoch_to_csv
 from utils.visualization import plot_coords_by_superpop, plot_clusters_by_superpop, plot_coords, plot_coords_by_pop, make_animation, write_f1_scores_to_csv
-from utils.distrib_config import define_distribution_strategy
+from utils.distrib_config import define_distribution_strategy, get_worker_id
 import utils.visualization
 import utils.layers
 import json
 import numpy as np
-import time
 import os, sys
 import glob
 import math
@@ -66,7 +63,6 @@ import copy
 import h5py
 import matplotlib.animation as animation
 from pathlib import Path
-from psutil import virtual_memory
 
 
 def _isChief():
@@ -428,7 +424,7 @@ class WeightKeeper:
 		if _isChief():
 			weights_dirname = chief_weights_dirname
 		else:
-			weights_dirname = "weights_tmp_" + os.environ["SLURMD_NODENAME"]
+			weights_dirname = "weights_tmp_" + get_worker_id()
 		weights_dir = os.path.join(train_directory, weights_dirname)
 		if not os.path.isdir(weights_dir):
 			os.makedirs(weights_dir)
@@ -1334,6 +1330,7 @@ if __name__ == "__main__":
 					            os.path.join(results_directory,
 					                         f"dimred_e_{epoch}"))
 
+		ae_weight_manager.cleanup()
 		timenow = f"{datetime.now().time()}"
 		if isChief:
 			print(f"Terminating workers on {timenow}")
