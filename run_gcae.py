@@ -342,8 +342,8 @@ def run_optimization(model, optimizer, loss_function,
 	gradients = g.gradient(loss_value, model.trainable_variables)
 
 	optimizer.apply_gradients(zip(gradients, model.trainable_variables),
-	                         #skip_gradients_aggregation=False)      # new Adam
-	                          experimental_aggregate_gradients=True) # legacy Adam
+	                          skip_gradients_aggregation=False)      # new Adam
+	                         #experimental_aggregate_gradients=True) # legacy Adam
 	# TODO: "If true, gradients aggregation will not be performed inside optimizer.
 	#        Usually this arg is set to True when you write custom code
 	#        aggregating gradients outside the optimizer. "
@@ -829,10 +829,7 @@ if __name__ == "__main__":
 		with strat.scope():
 			autoencoder = Autoencoder(model_architecture, n_markers,
 			                          noise_std, regularizer)
-			# In newer TF versions, Adam doesn't have _decayed_lr() anymore.
-			#optimizer = tf.keras.optimizers.Adam(learning_rate = lr_schedule)
-			# Temporary fix: legacy Adam
-			optimizer = tf.keras.optimizers.legacy.Adam(learning_rate = lr_schedule)
+			optimizer = tf.keras.optimizers.Adam(learning_rate = lr_schedule)
 			loss_obj = loss_class(**loss_args)
 
 			@tf.function
@@ -907,7 +904,7 @@ if __name__ == "__main__":
 				tf.summary.scalar("loss", loss_value, step=step_count)
 				if lr_schedule:
 					tf.summary.scalar("learning_rate",
-					        optimizer._decayed_lr(var_dtype=tf.float32),
+					        lr_schedule(step_count),
 					        step=step_count)
 				else:
 					tf.summary.scalar("learning_rate", learning_rate,
