@@ -61,6 +61,7 @@ import shutil
 import csv
 import copy
 import h5py
+import warnings
 import matplotlib.animation as animation
 from pathlib import Path
 
@@ -479,6 +480,55 @@ def get_latest_step(train_dir):
 	latest_step = int(float(f.readline().strip().split(",")[-1]))
 	f.close()
 	return latest_step
+
+
+def get_plot_colors(n=1, colormap="Blues", lower=0.3, upper=0.8):
+	cm = plt.get_cmap(colormap)
+	points = np.linspace(lower, upper, n+2)[1:-1]
+	colors = list(cm(points))
+	return colors
+
+
+def plot_metric(metr_coords, outfile, labels=None, colors=None,
+                mark_metric_id=None, mark_label="min valid loss",
+                xlab="Step", ylab="Loss"):
+	num_metrics = len(metr_coords)
+	if len(labels) != num_metrics:
+		warnings.warn(f"Got {len(labels)} metric labels, "+
+		              f"expected {num_metrics}; "+
+		               "overriding with generic labels")
+		labels = None
+	if len(colors) != num_metrics:
+		warnings.warn(f"Got {len(colors)} line colors, "+
+		              f"expected {num_metrics}; "+
+		               "overriding with random colors")
+		colors = None
+	if mark_metric_id is not None and mark_metric_id not in range(num_metrics):
+		warnings.warn(f"Mark index {mark_metric_id} is out of "+
+		              f"range({num_metrics}) and will be ignored")
+		mark_metric_id = None
+	
+	if labels is None:
+		labels = [f"Metric {i+1}" for i in range(num_metrics)]
+	if colors is None:
+		colors = np.random.randint(low=0, high=0xFFFFFF, size=num_metrics)
+		colors = ["#{:06X}".format(x) for x in colors]
+
+	fig, ax = plt.subplots()
+	for i in range(num_metrics):
+		steps, metric = metr_coords[i]
+		plt.plot(steps, metric, label=labels[i], c=colors[i])
+	if mark_metric_id is not None:
+		steps_m, metric_m = metr_coords[mark_metric_id]
+		mark_point = steps_m[np.argmin(metric_m)]
+		plt.axvline(mark_point, color="black")
+		plt.text(mark_point+0.1, 0.5, f"{mark_label} at step {int(mark_point)}",
+		        rotation=90, transform=ax.get_xaxis_text1_transform(0)[0])
+	plt.xlabel(xlab)
+	plt.ylabel(ylab)
+	plt.legend()
+	plt.savefig(outfile)
+	plt.close()
 
 
 if __name__ == "__main__":
@@ -1125,25 +1175,25 @@ if __name__ == "__main__":
 			# TODO: this is not "per epoch" anymore
 			# TODO: write these in column format, please!
 			steps_t_combined, losses_t_combined = write_metric_per_epoch_to_csv(outfilename, losses_t_per_step, all_steps)
-			fig, ax = plt.subplots()
-			plt.plot(steps_t_combined, losses_t_combined, label="train", c="orange")
 	
 			if n_valid_samples > 0:
 				outfilename = os.path.join(train_directory, "losses_from_train_v.csv")
 				# TODO: this is not "per epoch" anymore
 				steps_v_combined, losses_v_combined = write_metric_per_epoch_to_csv(outfilename, tracked_losses_v, tracked_steps_v)
-				plt.plot(steps_v_combined, losses_v_combined, label="valid", c="blue")
-				min_valid_loss_point = steps_v_combined[np.argmin(losses_v_combined)]
-				plt.axvline(min_valid_loss_point, color="black")
-				plt.text(min_valid_loss_point + 0.1, 0.5,'min valid loss at step {}'.format(int(min_valid_loss_point)),
-						 rotation=90,
-						 transform=ax.get_xaxis_text1_transform(0)[0])
-	
-			plt.xlabel("Steps")
-			plt.ylabel("Loss function value")
-			plt.legend()
-			plt.savefig(os.path.join(train_directory, "losses_from_train.pdf"))
-			plt.close()
+
+			plot_file = os.path.join(train_directory, "losses_from_train.pdf")
+			losses_to_plot = [(steps_t_combined, losses_t_combined)]
+			loss_labs = ["train"]
+			valid_loss_id = None
+			loss_colors = get_plot_colors(n=1, colormap="Oranges")
+			if n_valid_samples > 0:
+				losses_to_plot.append((steps_v_combined, losses_v_combined))
+				loss_labs.append("valid")
+				valid_loss_id = len(losses_to_plot)-1
+				loss_colors.extend(get_plot_colors(n=1, colormap="Blues"))
+			plot_metric(losses_to_plot, plot_file,
+			            labels=loss_labs, colors=loss_colors,
+			            mark_metric_id=valid_loss_id)
 
 		print("Done training at {0}. Wrote to {1}".format(
 		            datetime.now().time(), train_directory))
@@ -1353,13 +1403,13 @@ if __name__ == "__main__":
 		outfilename = os.path.join(results_directory, "losses_from_project.csv")
 		epochs_combined, losses_train_combined = write_metric_per_epoch_to_csv(outfilename, losses_train, epochs)
 
-		plt.plot(epochs_combined, losses_train_combined,
-		         label="all data", c="red")
-		plt.xlabel("Epoch")
-		plt.ylabel("Loss function value")
-		plt.legend()
-		plt.savefig(os.path.join(results_directory, "losses_from_project.pdf"))
-		plt.close()
+		plot_file = os.path.join(results_directory, "losses_from_project.pdf")
+		losses_to_plot = [(epochs_combined, losses_train_combined)]
+		loss_labs = ["all data"]
+		loss_colors = get_plot_colors(n=1, colormap="Reds")
+		plot_metric(losses_to_plot, plot_file,
+		            labels=loss_labs, colors=loss_colors,
+		            xlab="Epoch")
 
 		print(f"\n{datetime.now().time()}\n")
 
@@ -1378,16 +1428,22 @@ if __name__ == "__main__":
 		outfilename = os.path.join(results_directory, "genotype_concordances.csv")
 		epochs_combined, genotype_concs_combined = write_metric_per_epoch_to_csv(outfilename, genotype_concs_train, epochs)
 
-		plt.plot(epochs_combined, genotype_concs_combined, label="train", c="orange")
+		gc_coords = [(epochs_combined, genotype_concs_combined)]
+		gc_plot_file = os.path.join(results_directory,
+		                            "genotype_concordances.pdf")
+		gc_labels = ["train"]
+		gc_colors = ["orange"]
 		if baseline_genotype_concordance:
-			plt.plot([epochs_combined[0], epochs_combined[-1]], [baseline_genotype_concordance, baseline_genotype_concordance], label="baseline", c="black")
+			gc_coords.append((
+				[epochs_combined[0], epochs_combined[-1]],
+				[baseline_genotype_concordance for _ in range(2)]
+			))
+			gc_labels.append("baseline")
+			gc_colors.append("black")
+		plot_metric(gc_coords, gc_plot_file,
+		            labels=gc_labels, colors=gc_colors,
+		            xlab="Epoch", ylab="Genotype concordance")
 
-		plt.xlabel("Epoch")
-		plt.ylabel("Genotype concordance")
-
-		plt.savefig(os.path.join(results_directory, "genotype_concordances.pdf"))
-
-		plt.close()
 		######## END GC OUT
 
 	if arguments['animate']:
@@ -1541,12 +1597,11 @@ if __name__ == "__main__":
 			write_f1_scores_to_csv(results_directory, "epoch_{0}".format(epoch), superpopulations_file, f1_scores_by_pop, coords_by_pop)
 
 		for m in metric_names:
-
-			plt.plot(epochs, metrics[m], label="train", c="orange")
-			plt.xlabel("Epoch")
-			plt.ylabel(m)
-			plt.savefig(os.path.join(results_directory, m+".pdf"))
-			plt.close()
+			m_coords = [(epochs, metrics[m])]
+			plot_file = os.path.join(results_directory, m+".pdf")
+			plot_metric(m_coords, plot_file,
+			            labels=["train"], colors=["orange"],
+			            xlab="Epoch", ylab=m)
 
 			outfilename = os.path.join(results_directory, m+".csv")
 			with open(outfilename, mode='w') as res_file:
