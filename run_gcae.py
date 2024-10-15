@@ -336,11 +336,14 @@ def run_optimization(model, optimizer, loss_function,
 	'''
 	with tf.GradientTape() as g:
 		output, encoded_data = model(input, is_training=True)
-		loss_value = loss_function(y_pred = output, y_true = targets,
-		                           orig_nonmissing_mask = mask,
-		                           model_losses = model.losses)
-
-	gradients = g.gradient(loss_value, model.trainable_variables)
+		losses = loss_function(y_pred = output, y_true = targets,
+		                       orig_nonmissing_mask = mask,
+		                       model_losses = model.losses)
+	try:
+		full_loss = losses[-1]
+	except:
+		full_loss = losses
+	gradients = g.gradient(full_loss, model.trainable_variables)
 
 	optimizer.apply_gradients(zip(gradients, model.trainable_variables),
 	                          skip_gradients_aggregation=False)      # new Adam
@@ -349,7 +352,7 @@ def run_optimization(model, optimizer, loss_function,
 	#        Usually this arg is set to True when you write custom code
 	#        aggregating gradients outside the optimizer. "
 	#        ...maybe for phenomodel?
-	return loss_value
+	return losses
 
 @tf.function
 def train_step_distrib(model_, optimizer_, loss_function_,
@@ -358,34 +361,36 @@ def train_step_distrib(model_, optimizer_, loss_function_,
 	per_replica_losses = strat.run(run_optimization,
 	                               args=(model_, optimizer_, loss_function_,
 	                                     input_, targets_, mask_))
-	loss = strat.reduce("SUM", per_replica_losses, axis=None)
+	losses = strat.reduce("SUM", per_replica_losses, axis=None)
+	tf.print(per_replica_losses)
+	tf.print(losses)
 
-	return loss 
+	return losses
 
 @tf.function
 def compute_loss(model, loss_function, input, targets, mask):
-	output, _  = model(input, is_training=False)
-	loss_value = loss_function(y_pred = output, y_true = targets,
-	                           orig_nonmissing_mask = mask,
-	                           model_losses = model.losses)
-	return loss_value
+	output, _ = model(input, is_training=False)
+	losses = loss_function(y_pred = output, y_true = targets,
+	                       orig_nonmissing_mask = mask,
+	                       model_losses = model.losses)
+	return losses
 
 @tf.function
 def compute_loss_distrib(model_, loss_function_, input_, targets_, mask_):
 	per_replica_losses = strat.run(compute_loss,
 	                               args=(model_, loss_function_,
 	                                     input_, targets_, mask_))
-	loss = strat.reduce("SUM", per_replica_losses, axis=None)
-	return loss
+	losses = strat.reduce("SUM", per_replica_losses, axis=None)
+	return losses
 
 @tf.function
 def project_step(model, loss_function, input, targets, mask):
 	# TODO: combine with compute_loss() somehow?
-	decoded, encoded  = model(input, is_training=False)
-	loss_value = loss_function(y_pred = decoded, y_true = targets,
+	decoded, encoded = model(input, is_training=False)
+	losses = loss_function(y_pred = decoded, y_true = targets,
 	                           orig_nonmissing_mask = mask,
 	                           model_losses = model.losses)
-	return loss_value, decoded, encoded
+	return losses, decoded, encoded
 
 @tf.function
 def project_step_distrib(model_, loss_function_, input_, targets_, mask_):
@@ -395,8 +400,8 @@ def project_step_distrib(model_, loss_function_, input_, targets_, mask_):
 	 per_replica_encoded) = strat.run(project_step,
 	                                  args=(model_, loss_function_,
 	                                        input_, targets_, mask_))
-	loss = strat.reduce("SUM", per_replica_losses, axis=None)
-	return loss, per_replica_decoded, per_replica_encoded
+	losses = strat.reduce("SUM", per_replica_losses, axis=None)
+	return losses, per_replica_decoded, per_replica_encoded
 
 @tf.function
 def update_metric_distrib(metric, *args):
@@ -902,9 +907,11 @@ if __name__ == "__main__":
 				
 				per_example_loss  = loss_obj(y_pred=y_pred, y_true=y_true)
 				#per_example_loss /= self.n_markers  # TODO: ask why
-				loss = tf.nn.compute_average_loss(per_example_loss)
-				loss += tf.nn.scale_regularization_loss(sum(model_losses))
-				return loss
+				out_loss   = tf.nn.compute_average_loss(per_example_loss)
+				reg_loss   = tf.nn.scale_regularization_loss(sum(model_losses))
+				full_loss  = out_loss + reg_loss
+				all_losses = tf.constant([out_loss, reg_loss, full_loss])
+				return all_losses
 
 		# get a single batch to:
 		# a) run through optimization to reload weights and optimizer variables,
@@ -987,7 +994,7 @@ if __name__ == "__main__":
 		accum_loss_t = 0.0
 		tracked_steps_t  = []
 		tracked_steps_v  = []
-		tracked_losses_t = []
+		tracked_losses_t = []  # TODO: might not need this one
 		tracked_losses_v = []
 
 		# TODO: this impl relies on outer scope vars for tracking.
@@ -1005,17 +1012,23 @@ if __name__ == "__main__":
 
 			for batch_input_valid, batch_target_valid,\
 			    batch_orig_mask_valid, _, _ in dds_valid:
-				valid_loss_batch = compute_loss_distrib(autoencoder,
+				valid_batch_losses = compute_loss_distrib(autoencoder,
 				                                        loss_func,
 				                                        batch_input_valid,
 				                                        batch_target_valid,
 				                                        batch_orig_mask_valid)
-				losses_v_per_batch.append(valid_loss_batch)
+				valid_batch_losses = valid_batch_losses.numpy()
+				losses_v_per_batch.append(valid_batch_losses)
 				batch_count_valid += 1
 				if (max_batches_valid is not None
 				  and batch_count_valid > max_batches_valid):
 					break
-			valid_loss_this_eval_ = np.average(losses_v_per_batch)
+			losses_v_per_batch = np.array(losses_v_per_batch)
+			valid_losses_this_eval_ = np.average(losses_v_per_batch, axis=0)
+			if valid_losses_this_eval_.shape == ():
+				total_valid_loss_this_eval = valid_losses_this_eval_
+			else:
+				total_valid_loss_this_eval = valid_losses_this_eval_[-1]
 
 			valid_time = (datetime.now() - startTime).total_seconds()
 
@@ -1025,26 +1038,26 @@ if __name__ == "__main__":
 			min_valid_loss_epoch_ = min_valid_loss_epoch
 			min_valid_loss_step_  = min_valid_loss_step
 			# end danger zone 1
-			if valid_loss_this_eval_ <= min_valid_loss_:
-				min_valid_loss_ = valid_loss_this_eval_
+			if total_valid_loss_this_eval <= min_valid_loss_:
+				min_valid_loss_ = total_valid_loss_this_eval
 				min_valid_loss_epoch_ = eff_epoch
 				min_valid_loss_step_ = step_count
 
 			#evals_since_min_valid_loss_ = eff_epoch - min_valid_loss_epoch_
 			evals_since_min_valid_loss_ = step_count - min_valid_loss_step_
 			timenow = datetime.now().time()
-			print("--- Valid loss: {:.4f} ".format(valid_loss_this_eval_) +
+			print("--- Valid loss: {:.4f} ".format(total_valid_loss_this_eval) +
 			           f" time: {valid_time} ({timenow})" +
 			            " min loss: {:.4f} ".format(min_valid_loss_) +
 			           f" steps since: {evals_since_min_valid_loss_}")
 
 			# danger zone 2: adding to outer-scope lists
 			tracked_steps_v.append(step_count)
-			tracked_losses_v.append(valid_loss_this_eval_)
-			WriteSummaryValid(valid_loss_this_eval_, step_count)
+			tracked_losses_v.append(valid_losses_this_eval_)
+			WriteSummaryValid(total_valid_loss_this_eval, step_count)
 			# end danger zone 2
 
-			return valid_loss_this_eval_, min_valid_loss_,\
+			return valid_losses_this_eval_, min_valid_loss_,\
 			       min_valid_loss_epoch_, evals_since_min_valid_loss_
 
 		######################################################
@@ -1053,6 +1066,9 @@ if __name__ == "__main__":
 		print(f"Step count: {step_counter}")
 		print(f"Train samples: {n_train_samples}")
 		print(f"Valid samples: {n_valid_samples}")
+
+		if not resume_from:
+			ae_weight_manager.save(autoencoder, 0)
 
 		for e in range(1,epochs+1):
 			# TODO: profiler, mayhaps?
@@ -1069,11 +1085,13 @@ if __name__ == "__main__":
 			for batch_input, batch_target, batch_orig_mask, _, _ in dds_train:
 				step_counter += 1
 				all_steps.append(step_counter)
-				train_batch_loss = train_step_distrib(autoencoder,
-				                                      optimizer, loss_func,
-				                                      batch_input, batch_target,
-				                                      batch_orig_mask)
-				losses_t_per_batch.append(train_batch_loss)
+				train_batch_losses = train_step_distrib(autoencoder,
+				                                        optimizer, loss_func,
+				                                        batch_input,
+				                                        batch_target,
+				                                        batch_orig_mask)
+				train_batch_losses = train_batch_losses.numpy()
+				losses_t_per_batch.append(train_batch_losses)
 				batch_count_train += 1
 
 				did_one_batch = (effective_epoch==1 and
@@ -1081,7 +1099,11 @@ if __name__ == "__main__":
 				batches_since_last_loss  += 1
 				batches_since_last_valid += 1
 
-				accum_loss_t += train_batch_loss
+				if train_batch_losses.shape == ():
+					train_batch_full_loss = train_batch_losses
+				else:
+					train_batch_full_loss = train_batch_losses[-1]
+				accum_loss_t += train_batch_full_loss
 
 				# TODO: this averages losses over loss_interval.
 				#       could accumulate & average over all preceding batches instead.
@@ -1093,7 +1115,7 @@ if __name__ == "__main__":
 					tracked_steps_t.append(step_counter)
 					tracked_losses_t.append(current_mean_loss)
 					print("--- Train loss: {:.4f}".format(current_mean_loss))
-					WriteSummaryTrain(train_batch_loss, step_counter)
+					WriteSummaryTrain(train_batch_full_loss, step_counter)
 					batches_since_last_loss = 0
 					accum_loss_t = 0.0
 					# TODO: hide metrics tracking into an object as well.
@@ -1104,14 +1126,16 @@ if __name__ == "__main__":
 				  or did_one_batch)):
 					#### validation block ####
 					# (not fully encapsulated yet)
-					valid_loss_this_eval, \
+					valid_losses_this_eval, \
 					min_valid_loss, min_valid_loss_epoch, \
 					evals_since_min_valid_loss = run_validation(effective_epoch,
 					                                            step_counter)
 					# TODO: evals as in validation runs, not epochs!!!
-					if valid_loss_this_eval <= min_valid_loss:
-						#min_valid_loss = valid_loss_this_eval
-						#min_valid_loss_epoch = effective_epoch
+					if valid_losses_this_eval.shape == ():
+						total_valid_loss_this_eval = valid_losses_this_eval
+					else:
+						total_valid_loss_this_eval = valid_losses_this_eval[-1]
+					if total_valid_loss_this_eval <= min_valid_loss:
 						min_valid_loss_step  = step_counter
 						if e > start_saving_from:
 							ae_weight_manager.save(autoencoder, effective_epoch,
@@ -1130,11 +1154,15 @@ if __name__ == "__main__":
 			# (as long as get_batches() works)
 			if batches_since_last_valid > 0.05*n_train_batches/num_devices:
 				#### validation block ####
-				valid_loss_this_eval, \
+				valid_losses_this_eval, \
 				min_valid_loss, min_valid_loss_epoch, \
 				evals_since_min_valid_loss = run_validation(effective_epoch,
 				                                            step_counter)
-				if valid_loss_this_eval <= min_valid_loss:
+				if valid_losses_this_eval.shape == ():
+					total_valid_loss_this_eval = valid_losses_this_eval
+				else:
+					total_valid_loss_this_eval = valid_losses_this_eval[-1]
+				if total_valid_loss_this_eval <= min_valid_loss:
 					min_valid_loss_step  = step_counter
 					if e > start_saving_from:
 						ae_weight_manager.save(autoencoder, effective_epoch,
@@ -1142,20 +1170,26 @@ if __name__ == "__main__":
 				batches_since_last_valid = 0
 				#### end validation block ####
 
-			losses_t_per_step += losses_t_per_batch
-			train_loss_this_epoch = np.average(losses_t_per_batch)
+			losses_t_per_step.extend(losses_t_per_batch)
+			losses_t_per_batch = np.array(losses_t_per_batch)
+			train_loss_this_epoch = np.average(losses_t_per_batch, axis=0)
+			if train_loss_this_epoch.shape == ():
+				total_train_loss_this_epoch = train_loss_this_epoch
+			else:
+				total_train_loss_this_epoch = train_loss_this_epoch[-1]
 			train_time = (datetime.now() - startTime).total_seconds()
 			train_times.append(train_time)
 			train_epochs.append(effective_epoch)
 
 			print("--- Mean loss this epoch: {:.4f}  time: {} ({})".format(
-			          train_loss_this_epoch, train_time, datetime.now().time()))
+			          total_train_loss_this_epoch, train_time,
+			          datetime.now().time()))
 
 			# TODO: write mean losses per epoch separately
 			#tracked_steps_t.append(step_counter)
 			#tracked_losses_t.append(train_loss_this_epoch)
 
-			WriteSummaryTrain(train_loss_this_epoch, step_counter)
+			WriteSummaryTrain(total_train_loss_this_epoch, step_counter)
 
 			## validation block used to be here
 
@@ -1164,6 +1198,9 @@ if __name__ == "__main__":
 
 			if e % save_interval == 0 and e > start_saving_from :
 				ae_weight_manager.save(autoencoder, effective_epoch)
+
+		losses_t_per_step = np.array(losses_t_per_step)
+		tracked_losses_v  = np.array(tracked_losses_v)
 
 		ae_weight_manager.save(autoencoder, effective_epoch)
 
@@ -1174,11 +1211,13 @@ if __name__ == "__main__":
 			outfilename = os.path.join(train_directory, "losses_from_train_t.csv")
 			# TODO: this is not "per epoch" anymore
 			# TODO: write these in column format, please!
+			# TODO: losses_t_per_step can be 2D now.
 			steps_t_combined, losses_t_combined = write_metric_per_epoch_to_csv(outfilename, losses_t_per_step, all_steps)
 	
 			if n_valid_samples > 0:
 				outfilename = os.path.join(train_directory, "losses_from_train_v.csv")
 				# TODO: this is not "per epoch" anymore
+				# TODO: tracked_losses_v can be 2D now.
 				steps_v_combined, losses_v_combined = write_metric_per_epoch_to_csv(outfilename, tracked_losses_v, tracked_steps_v)
 
 			plot_file = os.path.join(train_directory, "losses_from_train.pdf")
@@ -1194,6 +1233,7 @@ if __name__ == "__main__":
 			plot_metric(losses_to_plot, plot_file,
 			            labels=loss_labs, colors=loss_colors,
 			            mark_metric_id=valid_loss_id)
+			# introducing this function didn't make the code any shorter and I don't like that.
 
 		print("Done training at {0}. Wrote to {1}".format(
 		            datetime.now().time(), train_directory))
@@ -1259,9 +1299,11 @@ if __name__ == "__main__":
 				
 				per_example_loss  = loss_obj(y_pred=y_pred, y_true=y_true)
 				#per_example_loss /= self.n_markers  # TODO: ask why
-				loss = tf.nn.compute_average_loss(per_example_loss)
-				loss += tf.nn.scale_regularization_loss(sum(model_losses))
-				return loss
+				out_loss   = tf.nn.compute_average_loss(per_example_loss)
+				reg_loss   = tf.nn.scale_regularization_loss(sum(model_losses))
+				full_loss  = out_loss + reg_loss
+				all_losses = tf.constant([out_loss, reg_loss, full_loss])
+				return all_losses
 
 			metric_gc = GenotypeConcordance()
 
@@ -1289,18 +1331,19 @@ if __name__ == "__main__":
 			projected_data = ProjectedOutput(n_latent_dim, n_markers, epoch,
 			                                 outfile_prefix=encoded_data_pref)
 
-			loss_value_per_batch = []
+			loss_values_per_batch = []
 			metric_gc.reset_states()
 			batch_count_proj = 0
 
 			for batch_input, batch_target,\
 			    batch_orig_mask, batch_sample_idx, _ in dds_proj:
 
-				loss_batch, decoded_batch, encoded_batch = \
+				losses_batch, decoded_batch, encoded_batch = \
 				    project_step_distrib(autoencoder, loss_func,
 				                         batch_input, batch_target,
 				                         batch_orig_mask)
-				loss_value_per_batch.append(loss_batch)
+				losses_batch = losses_batch.numpy()
+				loss_values_per_batch.append(losses_batch)
 
 				projected_data.update(strat, batch_sample_idx, encoded_batch,
 				                      decoded_batch, batch_target,
@@ -1317,8 +1360,9 @@ if __name__ == "__main__":
 				  and batch_count_proj > max_batches_train):
 					break
 
-			loss_value = np.average(loss_value_per_batch)
-			losses_train.append(loss_value)
+			loss_values_per_batch = np.array(loss_values_per_batch)
+			loss_values = np.average(loss_values_per_batch, axis=0)
+			losses_train.append(loss_values)
 
 			gc_this_epoch = metric_gc.result()
 			genotype_concs_train.append(gc_this_epoch)
@@ -1401,6 +1445,8 @@ if __name__ == "__main__":
 		############################### losses ##############################
 
 		outfilename = os.path.join(results_directory, "losses_from_project.csv")
+		# TODO: losses_train can now be 2d
+		losses_train = np.array(losses_train)
 		epochs_combined, losses_train_combined = write_metric_per_epoch_to_csv(outfilename, losses_train, epochs)
 
 		plot_file = os.path.join(results_directory, "losses_from_project.pdf")
