@@ -46,11 +46,12 @@ from utils.data_handler_distrib import (
 	alfreqvector
 )
 # TODO: look into reimplementing all these below as well:
-from utils.data_handler import get_saved_epochs, get_projected_epochs, read_h5, get_coords_by_pop, convex_hull_error, f1_score_kNN, plot_genotype_hist, to_genotypes_sigmoid_round, to_genotypes_invscale_round, get_pops_with_k, get_ind_pop_list_from_map, get_baseline_gc, write_metric_per_epoch_to_csv
+from utils.data_handler import get_saved_epochs, get_projected_epochs, read_h5, get_coords_by_pop, convex_hull_error, f1_score_kNN, plot_genotype_hist, to_genotypes_sigmoid_round, to_genotypes_invscale_round, get_pops_with_k, get_ind_pop_list_from_map, get_baseline_gc, write_metric_per_step_to_csv
 from utils.visualization import plot_coords_by_superpop, plot_clusters_by_superpop, plot_coords, plot_coords_by_pop, make_animation, write_f1_scores_to_csv
 from utils.distrib_config import define_distribution_strategy, get_worker_id
 import utils.visualization
 import utils.layers
+import itertools
 import json
 import numpy as np
 import os, sys
@@ -62,6 +63,7 @@ import csv
 import copy
 import h5py
 import warnings
+import pandas as pd
 import matplotlib.animation as animation
 from pathlib import Path
 
@@ -336,13 +338,11 @@ def run_optimization(model, optimizer, loss_function,
 	'''
 	with tf.GradientTape() as g:
 		output, encoded_data = model(input, is_training=True)
-		losses = loss_function(y_pred = output, y_true = targets,
-		                       orig_nonmissing_mask = mask,
-		                       model_losses = model.losses)
-	try:
-		full_loss = losses[-1]
-	except:
-		full_loss = losses
+		loss1, loss2, full_loss = loss_function(
+			y_pred = output, y_true = targets,
+			orig_nonmissing_mask = mask,
+			model_losses = model.losses
+		)
 	gradients = g.gradient(full_loss, model.trainable_variables)
 
 	optimizer.apply_gradients(zip(gradients, model.trainable_variables),
@@ -352,28 +352,26 @@ def run_optimization(model, optimizer, loss_function,
 	#        Usually this arg is set to True when you write custom code
 	#        aggregating gradients outside the optimizer. "
 	#        ...maybe for phenomodel?
-	return losses
+	return tf.stack([loss1, loss2, full_loss], axis=0)
 
 @tf.function
 def train_step_distrib(model_, optimizer_, loss_function_,
                        input_, targets_, mask_):
-
 	per_replica_losses = strat.run(run_optimization,
 	                               args=(model_, optimizer_, loss_function_,
 	                                     input_, targets_, mask_))
 	losses = strat.reduce("SUM", per_replica_losses, axis=None)
-	tf.print(per_replica_losses)
-	tf.print(losses)
-
 	return losses
 
 @tf.function
 def compute_loss(model, loss_function, input, targets, mask):
 	output, _ = model(input, is_training=False)
-	losses = loss_function(y_pred = output, y_true = targets,
-	                       orig_nonmissing_mask = mask,
-	                       model_losses = model.losses)
-	return losses
+	loss1, loss2, full_loss = loss_function(
+		y_pred = output, y_true = targets,
+		orig_nonmissing_mask = mask,
+		model_losses = model.losses
+	)
+	return tf.stack([loss1, loss2, full_loss], axis=0)
 
 @tf.function
 def compute_loss_distrib(model_, loss_function_, input_, targets_, mask_):
@@ -387,10 +385,13 @@ def compute_loss_distrib(model_, loss_function_, input_, targets_, mask_):
 def project_step(model, loss_function, input, targets, mask):
 	# TODO: combine with compute_loss() somehow?
 	decoded, encoded = model(input, is_training=False)
-	losses = loss_function(y_pred = decoded, y_true = targets,
-	                           orig_nonmissing_mask = mask,
-	                           model_losses = model.losses)
-	return losses, decoded, encoded
+	loss1, loss2, full_loss = loss_function(
+		y_pred = decoded, y_true = targets,
+		orig_nonmissing_mask = mask,
+		model_losses = model.losses
+	)
+	all_losses = tf.stack([loss1, loss2, full_loss], axis=0)
+	return all_losses, decoded, encoded
 
 @tf.function
 def project_step_distrib(model_, loss_function_, input_, targets_, mask_):
@@ -479,11 +480,14 @@ class WeightKeeper:
 		shutil.rmtree(self.weights_dir)
 
 
-def get_latest_step(train_dir):
-	loss_log = os.path.join(train_dir, "losses_from_train_t.csv")
-	f = open(loss_log, "r")
-	latest_step = int(float(f.readline().strip().split(",")[-1]))
-	f.close()
+def get_latest_step(train_dir, filename="losses_from_train_t.csv"):
+	loss_log = os.path.join(train_dir, filename)
+	try:
+		f = open(loss_log, "r")
+		latest_step = int(f.readlines()[-1].strip().split(",")[0])
+		f.close()
+	except:
+		latest_step = 0
 	return latest_step
 
 
@@ -494,41 +498,72 @@ def get_plot_colors(n=1, colormap="Blues", lower=0.3, upper=0.8):
 	return colors
 
 
-def plot_metric(metr_coords, outfile, labels=None, colors=None,
-                mark_metric_id=None, mark_label="min valid loss",
-                xlab="Step", ylab="Loss"):
-	num_metrics = len(metr_coords)
-	if len(labels) != num_metrics:
-		warnings.warn(f"Got {len(labels)} metric labels, "+
-		              f"expected {num_metrics}; "+
-		               "overriding with generic labels")
-		labels = None
-	if len(colors) != num_metrics:
+def plot_metrics(metrics_df: pd.DataFrame, outfile: str,
+                 colors: list = None,
+                 mark_metric_id: int = None, mark_label: str = "min valid loss",
+                 mark_max: bool = False,
+                 xlab: str = "Step", ylab: str = "Loss") -> None:
+	"""Plot given metrics in a single plot.
+
+	Arguments
+	---------
+	metrics_df: pandas.DataFrame
+	    Steps / epochs in the 1st column, metrics to plot in subsequent columns.
+	outfile: str
+	    Path to the output plot file.
+	colors: list, optional
+	    Colors for the metrics. If None (default), use Matplotlib defaults.
+	    Default: None
+	mark_metric_id: int, optional
+	    Number of a column in metrics_df. If not None, plot a vertical line
+	    where the metric in this column reaches a minimum (or maximum if
+	    mark_max is True).
+	    Default: None
+	mark_label: str, optional
+	    Text label for the marked metric.
+	    Default: "min valid loss"
+	mark_max: bool, optional
+	    Mark the maximum value of marked metric instead of minimum.
+	    Default: False
+	xlab: str, optional
+	    X axis label.
+	    Default: "Step"
+	ylab: str, optional
+	    Y axis label.
+	    Default: "Loss"
+	"""
+	n_metrics = metrics_df.shape[1]-1
+	labels = metrics_df.columns[1:]
+	if colors is not None and len(colors) != n_metrics:
 		warnings.warn(f"Got {len(colors)} line colors, "+
-		              f"expected {num_metrics}; "+
-		               "overriding with random colors")
+		              f"expected {n_metrics}; "+
+		               "using default colors instead")
 		colors = None
-	if mark_metric_id is not None and mark_metric_id not in range(num_metrics):
+	if mark_metric_id is not None and mark_metric_id not in range(1,n_metrics+1):
 		warnings.warn(f"Mark index {mark_metric_id} is out of "+
-		              f"range({num_metrics}) and will be ignored")
+		              f"range(1, {n_metrics}+1) and will be ignored")
 		mark_metric_id = None
-	
-	if labels is None:
-		labels = [f"Metric {i+1}" for i in range(num_metrics)]
+
 	if colors is None:
-		colors = np.random.randint(low=0, high=0xFFFFFF, size=num_metrics)
-		colors = ["#{:06X}".format(x) for x in colors]
+		cm = itertools.cycle(plt.rcParams["axes.prop_cycle"].by_key()["color"])
+		colors = [next(cm) for _ in range(n_metrics)]
 
 	fig, ax = plt.subplots()
-	for i in range(num_metrics):
-		steps, metric = metr_coords[i]
-		plt.plot(steps, metric, label=labels[i], c=colors[i])
+	for i in range(n_metrics):
+		metric_data = metrics_df.iloc[:,[0,1+i]].dropna()
+		plt.plot(metric_data.iloc[:,0], metric_data.iloc[:,1],
+		         label=labels[i], c=colors[i], linewidth=0.7)
 	if mark_metric_id is not None:
-		steps_m, metric_m = metr_coords[mark_metric_id]
-		mark_point = steps_m[np.argmin(metric_m)]
+		metric_data_m = metrics_df.iloc[:,[0,mark_metric_id]]
+		steps_m  = metric_data_m.iloc[:,0]
+		metric_m = metric_data_m.iloc[:,1]
+		if mark_max:
+			mark_point = steps_m[np.nanargmax(metric_m)]
+		else:
+			mark_point = steps_m[np.nanargmin(metric_m)]
 		plt.axvline(mark_point, color="black")
 		plt.text(mark_point+0.1, 0.5, f"{mark_label} at step {int(mark_point)}",
-		        rotation=90, transform=ax.get_xaxis_text1_transform(0)[0])
+		         rotation=90, transform=ax.get_xaxis_text1_transform(0)[0])
 	plt.xlabel(xlab)
 	plt.ylabel(ylab)
 	plt.legend()
@@ -910,8 +945,10 @@ if __name__ == "__main__":
 				out_loss   = tf.nn.compute_average_loss(per_example_loss)
 				reg_loss   = tf.nn.scale_regularization_loss(sum(model_losses))
 				full_loss  = out_loss + reg_loss
-				all_losses = tf.constant([out_loss, reg_loss, full_loss])
-				return all_losses
+				return out_loss, reg_loss, full_loss
+
+		# this goes withh loss_func
+		loss_names = ["CE loss", "model loss", "full loss"]
 
 		# get a single batch to:
 		# a) run through optimization to reload weights and optimizer variables,
@@ -1204,35 +1241,54 @@ if __name__ == "__main__":
 
 		ae_weight_manager.save(autoencoder, effective_epoch)
 
+		metric_files = [
+			"train_times.csv",
+			"losses_from_train_t.csv",
+			"losses_from_train_v.csv"
+		]
+		metric_files = [os.path.join(train_directory, f) for f in metric_files]
+		if isChief and not resume_from:
+			for outfilename in metric_files:
+				if os.path.isfile(outfilename):
+					os.remove(outfilename)
+
 		if isChief:
-			outfilename = os.path.join(train_directory, "train_times.csv")
-			write_metric_per_epoch_to_csv(outfilename, train_times, train_epochs)
-	
-			outfilename = os.path.join(train_directory, "losses_from_train_t.csv")
-			# TODO: this is not "per epoch" anymore
-			# TODO: write these in column format, please!
-			# TODO: losses_t_per_step can be 2D now.
-			steps_t_combined, losses_t_combined = write_metric_per_epoch_to_csv(outfilename, losses_t_per_step, all_steps)
-	
+			outfilename = metric_files[0]
+			_ = write_metric_per_step_to_csv(
+				outfilename,
+				steps = train_epochs,
+				values = train_times,
+				names = ["epoch", "train time"]
+			)
+
+			outfilename = metric_files[1]
+			losses_t_combined = write_metric_per_step_to_csv(
+				outfilename,
+				steps = all_steps,
+				values = losses_t_per_step,
+				names = ["step", *["train "+name for name in loss_names]]
+			)
+
 			if n_valid_samples > 0:
-				outfilename = os.path.join(train_directory, "losses_from_train_v.csv")
-				# TODO: this is not "per epoch" anymore
-				# TODO: tracked_losses_v can be 2D now.
-				steps_v_combined, losses_v_combined = write_metric_per_epoch_to_csv(outfilename, tracked_losses_v, tracked_steps_v)
+				outfilename = metric_files[2]
+				losses_v_combined = write_metric_per_step_to_csv(
+					outfilename,
+					steps = tracked_steps_v,
+					values = tracked_losses_v,
+					names = ["step", *["valid "+name for name in loss_names]]
+				)
 
 			plot_file = os.path.join(train_directory, "losses_from_train.pdf")
-			losses_to_plot = [(steps_t_combined, losses_t_combined)]
-			loss_labs = ["train"]
+			losses_to_plot = losses_t_combined
 			valid_loss_id = None
-			loss_colors = get_plot_colors(n=1, colormap="Oranges")
 			if n_valid_samples > 0:
-				losses_to_plot.append((steps_v_combined, losses_v_combined))
-				loss_labs.append("valid")
-				valid_loss_id = len(losses_to_plot)-1
-				loss_colors.extend(get_plot_colors(n=1, colormap="Blues"))
-			plot_metric(losses_to_plot, plot_file,
-			            labels=loss_labs, colors=loss_colors,
-			            mark_metric_id=valid_loss_id)
+				losses_to_plot = pd.merge_ordered(losses_t_combined,
+				                                  losses_v_combined,
+				                                  how="outer")
+				losses_to_plot.sort_values(by="step", inplace=True)
+				valid_loss_id = losses_to_plot.shape[1]-1
+			plot_metrics(losses_to_plot, plot_file,
+			             mark_metric_id=valid_loss_id)
 			# introducing this function didn't make the code any shorter and I don't like that.
 
 		print("Done training at {0}. Wrote to {1}".format(
@@ -1285,6 +1341,7 @@ if __name__ == "__main__":
 			autoencoder = Autoencoder(model_architecture, n_markers,
 			                          noise_std, regularizer)
 			loss_obj = loss_class(**loss_args)
+			metric_gc = GenotypeConcordance()
 
 			@tf.function
 			def loss_func(y_pred, y_true, orig_nonmissing_mask, model_losses):
@@ -1302,10 +1359,10 @@ if __name__ == "__main__":
 				out_loss   = tf.nn.compute_average_loss(per_example_loss)
 				reg_loss   = tf.nn.scale_regularization_loss(sum(model_losses))
 				full_loss  = out_loss + reg_loss
-				all_losses = tf.constant([out_loss, reg_loss, full_loss])
-				return all_losses
+				return out_loss, reg_loss, full_loss
 
-			metric_gc = GenotypeConcordance()
+		# this goes withh loss_func
+		loss_names = ["CE loss", "model loss", "full loss"]
 
 		# loss function of the train set per epoch
 		losses_train = []
@@ -1445,17 +1502,16 @@ if __name__ == "__main__":
 		############################### losses ##############################
 
 		outfilename = os.path.join(results_directory, "losses_from_project.csv")
-		# TODO: losses_train can now be 2d
 		losses_train = np.array(losses_train)
-		epochs_combined, losses_train_combined = write_metric_per_epoch_to_csv(outfilename, losses_train, epochs)
+		losses_train_combined = write_metric_per_step_to_csv(
+			outfilename,
+			steps = epochs,
+			values = losses_train,
+			names = ["epoch", *loss_names]
+		)
 
 		plot_file = os.path.join(results_directory, "losses_from_project.pdf")
-		losses_to_plot = [(epochs_combined, losses_train_combined)]
-		loss_labs = ["all data"]
-		loss_colors = get_plot_colors(n=1, colormap="Reds")
-		plot_metric(losses_to_plot, plot_file,
-		            labels=loss_labs, colors=loss_colors,
-		            xlab="Epoch")
+		plot_metrics(losses_train_combined, plot_file, xlab="Epoch")
 
 		print(f"\n{datetime.now().time()}\n")
 
@@ -1472,23 +1528,22 @@ if __name__ == "__main__":
 		baseline_genotype_concordance = None
 
 		outfilename = os.path.join(results_directory, "genotype_concordances.csv")
-		epochs_combined, genotype_concs_combined = write_metric_per_epoch_to_csv(outfilename, genotype_concs_train, epochs)
+		gc_combined = write_metric_per_step_to_csv(
+			outfilename,
+			steps = epochs,
+			values = genotype_concs_train,
+			names = ["step", "train GC"]
+		)
 
-		gc_coords = [(epochs_combined, genotype_concs_combined)]
 		gc_plot_file = os.path.join(results_directory,
 		                            "genotype_concordances.pdf")
-		gc_labels = ["train"]
 		gc_colors = ["orange"]
 		if baseline_genotype_concordance:
-			gc_coords.append((
-				[epochs_combined[0], epochs_combined[-1]],
-				[baseline_genotype_concordance for _ in range(2)]
-			))
-			gc_labels.append("baseline")
+			bgc = np.repeat(baseline_genotype_concordance, gc_combined.shape[0])
+			gc_combined["baseline GC"] = bgc
 			gc_colors.append("black")
-		plot_metric(gc_coords, gc_plot_file,
-		            labels=gc_labels, colors=gc_colors,
-		            xlab="Epoch", ylab="Genotype concordance")
+		plot_metrics(gc_combined, gc_plot_file, colors=gc_colors,
+		             xlab="Epoch", ylab="Genotype concordance")
 
 		######## END GC OUT
 
@@ -1643,11 +1698,10 @@ if __name__ == "__main__":
 			write_f1_scores_to_csv(results_directory, "epoch_{0}".format(epoch), superpopulations_file, f1_scores_by_pop, coords_by_pop)
 
 		for m in metric_names:
-			m_coords = [(epochs, metrics[m])]
+			m_coords = pd.DataFrame({"epoch": epochs, m: metrics[m]})
 			plot_file = os.path.join(results_directory, m+".pdf")
-			plot_metric(m_coords, plot_file,
-			            labels=["train"], colors=["orange"],
-			            xlab="Epoch", ylab=m)
+			plot_metrics(m_coords, plot_file, colors=["orange"],
+			             xlab="Epoch", ylab=m)
 
 			outfilename = os.path.join(results_directory, m+".csv")
 			with open(outfilename, mode='w') as res_file:

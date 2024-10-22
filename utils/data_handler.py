@@ -4,6 +4,7 @@ import h5py
 import utils.normalization as normalization
 import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
+import pandas as pd
 import random
 from scipy.spatial import ConvexHull
 import functools
@@ -832,6 +833,53 @@ def write_metric_per_epoch_to_csv(filename, values, epochs):
 		res_writer.writerow(np.array(values_combined))
 
 	return  epochs_combined, values_combined
+
+
+def write_metric_per_step_to_csv(filename: str,
+                                 steps: np.ndarray, values: np.ndarray,
+                                 names: list) -> pd.DataFrame:
+	"""Write or append value of metric(s) per step to csv file.
+
+	Return the total data in the resulting file, with given steps and values
+	appended to any pre-existing data in the file.
+	Assumes format of file is steps in first column, corresponding values in
+	subsequent columns.
+
+	Arguments
+	---------
+	filename: str
+	    Full name and path of csv file.
+	steps: array-like
+	    1D array of steps.
+	values: array-like
+	    1D or 2D array of metric values per step.
+	names: array-like
+	    Desired column names for steps and values.
+
+	Returns
+	-------
+	pandas.DataFrame
+	    A dataframe with the given steps+values data, combined with pre-existing
+	    data in the file (if any).
+	"""
+	steps  = np.array(steps)[:,np.newaxis]
+	values = np.array(values)
+	if values.ndim == 1:
+		values = values[:,np.newaxis]
+	new_data = np.concatenate((steps, values), axis=1)
+	new_data = pd.DataFrame(data=new_data, columns=list(names))
+
+	if os.path.isfile(filename):
+		saved_data = pd.read_csv(filename, header=0)
+		combined_data = pd.merge_ordered(saved_data, new_data, how="outer")
+	else:
+		combined_data = new_data
+
+	combined_data.sort_values(by=names[0], inplace=True)
+	combined_data[names[0]] = combined_data[names[0]].astype(int)
+	combined_data.to_csv(filename, index=False, float_format="%.6f")
+
+	return combined_data
 
 
 def plot_genotype_hist(genotypes, filename):
